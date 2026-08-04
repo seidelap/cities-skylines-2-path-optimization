@@ -14,8 +14,8 @@ namespace CS2Path.Core
         public float EnvelopeEps = 0.30f;     // ε-envelope retention (§4.8)
         public float CertTolerance = 2e-3f;   // certified-exact threshold (float slack)
         public float RepairGapThreshold = 0.01f;
-        public int RepairMaxSettled = 4000;   // repair is best-effort: past this the potential was too loose
-        public int PenaltyMaxSettled = 30000;
+        public int RepairMaxSettled = 2000;   // repair is best-effort: past this the potential was too loose
+        public int PenaltyMaxSettled = 8000;
         public bool UseFreeFlowDiversity = true;
     }
 

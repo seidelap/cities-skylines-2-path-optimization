@@ -99,7 +99,7 @@ namespace CS2Path.Harness
         private static string Bench(Dictionary<string, string> opts, ulong seed)
         {
             int cols = (int)GetOpt(opts, "cols", 362), rows = (int)GetOpt(opts, "rows", 362);
-            int profiles = (int)GetOpt(opts, "profiles", 8);
+            int profiles = (int)GetOpt(opts, "profiles", 12); // §4.8 baseline: 12-16 preference profiles
             int nQueries = (int)GetOpt(opts, "queries", 100_000);
             int nTrips = (int)GetOpt(opts, "trips", 20_000);
             var sb = new StringBuilder();
