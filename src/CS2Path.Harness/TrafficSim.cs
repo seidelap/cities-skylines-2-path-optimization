@@ -54,7 +54,8 @@ namespace CS2Path.Harness
         // measurement hooks
         public Action<int, int>? OnEdgeEnter;   // (agent, edge)
         public long FinishedTrips, TotalTravelTicks, VanillaQueries, VanillaWaitReplans;
-        public double MsPlanning, MsMovement, MsRefresh, MsCustomize, MsWakes;
+        public double MsPlanning, MsMovement, MsRefresh, MsCustomize, MsWakes, MsExploration;
+        public int ExplorationBudgetPerRefresh = 6;
 
         private int _scheduleCursor;
         private float[]? _lastNotifiedMult;
@@ -80,6 +81,7 @@ namespace CS2Path.Harness
             if (mode == SimMode.Rebuild)
             {
                 sim.Planner = new TripPlanner(eng!.Metrics, eng.Query);
+                sim.Planner.Cache = new ClusterCache(eng.CellPaths); // §4.9
                 sim.Upd = new UpdateEngine(g, sim.Planner, eng.RegionOf, eng.RegionCount);
                 sim.Detector = new SoftClosureDetector(g);
             }
@@ -134,6 +136,7 @@ namespace CS2Path.Harness
                     if (!plan.HasPlan) { trip.Finished = true; Trips.Add(trip); continue; }
                     trip.CurrentNode = req.Origin;
                     trip.LastRemainingCost = plan.Alts[plan.ChosenIdx].AnchorCost;
+                    ArmTriggers(trip);
                     Trips.Add(trip);
                     Upd!.RegisterRoute(Trips.Count - 1, trip);
                 }
@@ -205,6 +208,16 @@ namespace CS2Path.Harness
             }
         }
 
+        /// <summary>§4 L4 v2: decision-point triggers spaced along the trunk
+        /// (approximating the nest tree's branch points + sparse virtual
+        /// checkpoints on long trunks).</summary>
+        private void ArmTriggers(ActiveTrip t)
+        {
+            int len = t.Plan.ChosenEdgePath.Count;
+            t.TriggerSpacing = Math.Max(8, len / 6);
+            t.NextTriggerAt = t.PathCursor + t.TriggerSpacing;
+        }
+
         private void Enter(int agent, ActiveTrip t, int e)
         {
             Occ[e] += 1;
@@ -212,6 +225,11 @@ namespace CS2Path.Harness
             t.CurrentNode = G.Head[e];
             t.PathCursor++;
             t.QueuedTicks = 0;
+            if (Upd != null && t.PathCursor >= t.NextTriggerAt && t.PathCursor < t.Plan.ChosenEdgePath.Count)
+            {
+                t.NextTriggerAt = t.PathCursor + t.TriggerSpacing;
+                Upd.OnDecisionPoint(agent);
+            }
             float density = Occ[e] / Math.Max(1f, JamCap[e]);
             t.EdgeTimeLeft = G.TimeFree[e] * (1f + 0.3f * density * density);
             if (EnterTick == null || EnterTick.Length < Trips.Count) Array.Resize(ref EnterTick, Math.Max(Trips.Count * 2, 1024));
@@ -360,6 +378,12 @@ namespace CS2Path.Harness
             Upd.Sweep(Trips, RefreshInterval);
             Upd.ProcessWakes(Trips, OnSwitched, OnRegenerate);
             MsWakes += sw.Elapsed.TotalMilliseconds;
+
+            // §4.7/§4.9 exploration budget — off the trip-planning critical path
+            // (in-game: a background job; here: a bounded slice per refresh)
+            sw.Restart();
+            Planner!.RunExploration(ExplorationBudgetPerRefresh);
+            MsExploration += sw.Elapsed.TotalMilliseconds;
         }
 
         private void OnSwitched(int agent, int altIdx)
@@ -370,6 +394,7 @@ namespace CS2Path.Harness
             t.Plan.ChosenEdgePath.AddRange(_expandBuf);
             t.PathCursor = 0;
             t.RouteVersion++;
+            ArmTriggers(t);
             Upd!.RegisterRoute(agent, t);
         }
 
@@ -389,6 +414,7 @@ namespace CS2Path.Harness
             t.PathCursor = 0;
             t.RouteVersion++;
             t.LastRemainingCost = fresh.Alts[fresh.ChosenIdx].AnchorCost;
+            ArmTriggers(t);
             Upd!.RegisterRoute(agent, t);
             return true;
         }

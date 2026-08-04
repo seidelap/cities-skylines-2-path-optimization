@@ -13,15 +13,31 @@ namespace CS2Path.Core
     /// </summary>
     public static class NestedDissection
     {
+        /// <summary>Per-node position in the dissection-cell hierarchy (§4.9):
+        /// the cluster-cache hierarchy IS the elimination hierarchy. PathBits
+        /// records the left/right branch taken at each recursion level; Depth is
+        /// how many levels deep the node's cell sits. Separator nodes carry the
+        /// path of the cell they separate.</summary>
+        public struct CellPath
+        {
+            public ulong PathBits;
+            public byte Depth;
+        }
+
+        public static int[] ComputeOrder(Graph g) => ComputeOrder(g, out _);
+
         /// <summary>Compute an elimination order. rank[v] in [0, n); higher
-        /// rank = later elimination = higher in the hierarchy.</summary>
-        public static int[] ComputeOrder(Graph g)
+        /// rank = later elimination = higher in the hierarchy. Also emits each
+        /// node's dissection-cell path (§4.9).</summary>
+        public static int[] ComputeOrder(Graph g, out CellPath[] cellPathsOut)
         {
             int n = g.NodeCount;
             var rank = new int[n];
             var nodes = new int[n];
             for (int i = 0; i < n; i++) nodes[i] = i;
             int next = 0; // next rank to assign, ascending
+            var cellPaths = new CellPath[n];
+            cellPathsOut = cellPaths;
 
             // Undirected adjacency (union of both directions) for separator finding.
             // Reuse CSR by scanning both out-edges and in-edges.
@@ -29,14 +45,18 @@ namespace CS2Path.Core
             var inSet = new int[n];        // scratch: recursion-set membership stamp
             int stamp = 0;
 
-            void Recurse(int[] set, int count)
+            void Recurse(int[] set, int count, ulong path, byte depth)
             {
                 const int BaseCase = 48;
                 if (count <= BaseCase)
                 {
                     // Local order: sequential is fine inside a small spatially
                     // coherent cell; fill-in is bounded by the cell size.
-                    for (int i = 0; i < count; i++) rank[set[i]] = next++;
+                    for (int i = 0; i < count; i++)
+                    {
+                        cellPaths[set[i]] = new CellPath { PathBits = path, Depth = depth };
+                        rank[set[i]] = next++;
+                    }
                     return;
                 }
 
@@ -137,7 +157,11 @@ namespace CS2Path.Core
                 }
                 if (nA == 0 || nB == 0)
                 {
-                    for (int i = 0; i < count; i++) rank[set[i]] = next++;
+                    for (int i = 0; i < count; i++)
+                    {
+                        cellPaths[set[i]] = new CellPath { PathBits = path, Depth = depth };
+                        rank[set[i]] = next++;
+                    }
                     return;
                 }
 
@@ -151,13 +175,20 @@ namespace CS2Path.Core
                     else s[isep++] = v;
                 }
 
-                // Recurse: both halves first (lower ranks), separator last (highest).
-                Recurse(a, nA);
-                Recurse(b, nB);
-                for (int i = 0; i < nSep; i++) rank[s[i]] = next++;
+                // Recurse: both halves first (lower ranks), separator last
+                // (highest). Separator nodes belong to the cell they separate.
+                byte childDepth = depth < 62 ? (byte)(depth + 1) : depth;
+                ulong bBit = depth < 62 ? 1UL << depth : 0UL;
+                Recurse(a, nA, path, childDepth);
+                Recurse(b, nB, path | bBit, childDepth);
+                for (int i = 0; i < nSep; i++)
+                {
+                    cellPaths[s[i]] = new CellPath { PathBits = path, Depth = depth };
+                    rank[s[i]] = next++;
+                }
             }
 
-            Recurse(nodes, n);
+            Recurse(nodes, n, 0UL, 0);
             if (next != n) throw new InvalidOperationException($"order incomplete: {next}/{n}");
             return rank;
         }

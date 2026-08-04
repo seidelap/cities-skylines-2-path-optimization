@@ -348,6 +348,86 @@ namespace CS2Path.Harness
             sb.AppendLine();
             Console.WriteLine($"  plan median={Pct(allPlan, 0.5):0.0}us certified={certFrac:P1} repairs={telemetry.RepairSearches} repairP99={Pct(repairs, 0.99):N0}us");
 
+            // --- §4.9 route-knowledge cache under zonal demand ---
+            Console.WriteLine("bench: §4.9 cluster cache under zonal demand...");
+            {
+                var planner = new TripPlanner(eng.Metrics, eng.Query);
+                var cache = new ClusterCache(eng.CellPaths);
+                planner.Cache = cache;
+                planner.Stats.SyncFallbackTimesUs = new List<double>();
+                // demand model: 65% of trips among Z zone pairs (commuter flows),
+                // 35% uniform — cache hit rate is a demand-locality property
+                int Z = 40;
+                var zones = new (int o, int d)[Z];
+                for (int z = 0; z < Z; z++) zones[z] = (rng.NextInt(g.NodeCount), rng.NextInt(g.NodeCount));
+                int[] NearbyPool(int center)
+                {
+                    var pool = new List<int> { center };
+                    var q2 = new Queue<int>(); q2.Enqueue(center);
+                    var seen = new HashSet<int> { center };
+                    while (q2.Count > 0 && pool.Count < 120)
+                    {
+                        int v = q2.Dequeue();
+                        for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++)
+                            if (seen.Add(g.Head[e])) { pool.Add(g.Head[e]); q2.Enqueue(g.Head[e]); }
+                    }
+                    return pool.ToArray();
+                }
+                var oPools = new int[Z][]; var dPools = new int[Z][];
+                for (int z = 0; z < Z; z++) { oPools[z] = NearbyPool(zones[z].o); dPools[z] = NearbyPool(zones[z].d); }
+
+                int nCacheTrips = 30_000;
+                var warmLat = new List<double>(nCacheTrips); var coldLat = new List<double>(nCacheTrips);
+                long altBytes = 0, pathBytes = 0, planCount = 0;
+                for (int i = 0; i < nCacheTrips; i++)
+                {
+                    int s2, t2;
+                    if (rng.NextFloat() < 0.65f)
+                    {
+                        int z = rng.NextInt(Z);
+                        s2 = oPools[z][rng.NextInt(oPools[z].Length)];
+                        t2 = dPools[z][rng.NextInt(dPools[z].Length)];
+                    }
+                    else { s2 = rng.NextInt(g.NodeCount); t2 = rng.NextInt(g.NodeCount); }
+                    var req = new TripRequest
+                    {
+                        AgentId = i, Origin = s2, Destination = t2,
+                        Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
+                        Seed = seed ^ (ulong)(i * 48271),
+                    };
+                    long t0 = Stopwatch.GetTimestamp();
+                    var plan = planner.PlanFixed(in req);
+                    double us = (Stopwatch.GetTimestamp() - t0) * 1e6 / Stopwatch.Frequency;
+                    (plan.ServedFromCache ? warmLat : coldLat).Add(us);
+                    if (plan.HasPlan)
+                    {
+                        planCount++;
+                        altBytes += 32 + plan.Alts.Count * 24; // cursor: held-branch view + stamps
+                        pathBytes += plan.ChosenEdgePath.Count * 4;
+                    }
+                    // off-critical-path exploration trickle, as the sim runs it
+                    if (i % 200 == 199) planner.RunExploration(4);
+                }
+                var st2 = planner.Stats;
+                double hitRate = (double)st2.ServedFromCache / Math.Max(1, st2.ServedFromCache + st2.DirectGenerations);
+                sb.AppendLine("### Layer 2 v2 — §4.9 route-knowledge cache (zonal demand, 65% on 40 zone pairs)");
+                sb.AppendLine();
+                sb.AppendLine("| measure | value | design claim |");
+                sb.AppendLine("|---|---|---|");
+                sb.AppendLine($"| cache-served share | {hitRate:P1} ({st2.ServedFromCache:N0} of {st2.ServedFromCache + st2.DirectGenerations:N0}) | high under commuter locality |");
+                sb.AppendLine($"| warm plan latency (cache-served) | median {Pct(warmLat, 0.5):N0} µs, p99 {Pct(warmLat, 0.99):N0} µs | — |");
+                sb.AppendLine($"| cold plan latency (direct generation, seeds entry) | median {Pct(coldLat, 0.5):N0} µs, p99 {Pct(coldLat, 0.99):N0} µs | demoted to seeding fallback |");
+                sb.AppendLine($"| warm/cold speedup | {Pct(coldLat, 0.5) / Math.Max(1, Pct(warmLat, 0.5)):0.0}x median | — |");
+                sb.AppendLine($"| quarantine diversions (thin entry -> direct gen) | {st2.QuarantineDiversions:N0} | surge never funneled onto one path |");
+                sb.AppendLine($"| sync fallbacks (portfolio collapse) | {st2.SyncFallbacks:N0}, p99 {(st2.SyncFallbackTimesUs!.Count > 0 ? Pct(st2.SyncFallbackTimesUs, 0.99) : 0):N0} µs | p99 < 500 µs (§6) |");
+                sb.AppendLine($"| exploration | {st2.ExplorationTasks:N0} tasks, {st2.ExplorationDonated:N0} donated vias, {st2.ExplorationTimeUs / Math.Max(1, st2.ExplorationTasks):N0} µs/task | off the critical path |");
+                sb.AppendLine($"| certificate gaps -> exploration demand | {st2.ExplorationDemandLogged:N0} (no synchronous repairs: {st2.RepairSearches}) | §4.7 v2 |");
+                sb.AppendLine($"| cache footprint | {cache.EntryCount:N0} entries, {cache.EstimatedBytes() / 1e6:0.0} MB | tens of MB at 10⁴-10⁵ entries |");
+                sb.AppendLine($"| retained per-agent cursor | {altBytes / Math.Max(1, planCount):N0} B (+{pathBytes / Math.Max(1, planCount):N0} B driven geometry) | tens of bytes + driven route |");
+                sb.AppendLine();
+                Console.WriteLine($"  hit={hitRate:P1} warm={Pct(warmLat, 0.5):N0}us cold={Pct(coldLat, 0.5):N0}us entries={cache.EntryCount} cacheMB={cache.EstimatedBytes() / 1e6:0.0} cursorB={altBytes / Math.Max(1, planCount)}");
+            }
+
             // --- re-pricing ---
             Console.WriteLine("bench: via-node re-pricing...");
             {

@@ -22,6 +22,9 @@ namespace CS2Path.Core
         public CchQuery Query = null!;
         public int[] RegionOf = null!;
         public int RegionCount;
+        /// <summary>§4.9: per-node dissection-cell paths — the cluster-cache
+        /// hierarchy is the elimination hierarchy, tracking rebuilds for free.</summary>
+        public NestedDissection.CellPath[] CellPaths = null!;
         public FeatureFlags Flags = new FeatureFlags();
 
         public double BuildOrderMs, BuildSkeletonMs, FullCustomizeMs;
@@ -33,7 +36,8 @@ namespace CS2Path.Core
         {
             var e = new RoutingEngine { G = g, Anchors = anchors };
             var sw = Stopwatch.StartNew();
-            var rank = NestedDissection.ComputeOrder(g);
+            var rank = NestedDissection.ComputeOrder(g, out var cellPaths);
+            e.CellPaths = cellPaths;
             e.BuildOrderMs = sw.Elapsed.TotalMilliseconds;
 
             sw.Restart();
@@ -106,6 +110,7 @@ namespace CS2Path.Core
             _pendingRebuild = null;
             G = p.G; Skeleton = p.Skeleton; Metrics = p.Metrics; Query = p.Query;
             RegionOf = p.RegionOf; RegionCount = p.RegionCount;
+            CellPaths = p.CellPaths; // cluster cache must be recreated by the owner
             return true;
         }
     }

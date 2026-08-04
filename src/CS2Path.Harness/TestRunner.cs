@@ -49,7 +49,9 @@ namespace CS2Path.Harness
             VerifyDispatch(seed + 9);
             Console.WriteLine("verify: soft-closure state machine...");
             VerifySoftClosure();
-            Console.WriteLine("verify: end-to-end sim smoke test (switches, arrivals, no faults)...");
+            Console.WriteLine("verify: §4.9 cluster cache (hits, quarantine, async exploration)...");
+            VerifyClusterCache(seed + 11);
+            Console.WriteLine("verify: end-to-end sim smoke test (switches, arrivals, decision points)...");
             VerifySimSmoke(seed + 10);
 
             report = $"verify: {_pass} passed, {_fail} failed\n" + Log;
@@ -392,6 +394,78 @@ namespace CS2Path.Harness
             Check(g.ClosureMult[0] == 1f && !det.IsSoftClosed(0), "soft closure did not release after recovery");
         }
 
+        private static void VerifyClusterCache(ulong seed)
+        {
+            var city = SyntheticCity.Build(40, 40, 2000, 200, seed);
+            var anchors = city.BuildAnchors(6);
+            var eng = RoutingEngine.Build(city.G, anchors);
+            var g = city.G;
+            var planner = new TripPlanner(eng.Metrics, eng.Query);
+            var cache = new ClusterCache(eng.CellPaths);
+            planner.Cache = cache;
+            var rng = new SplitMix64(seed);
+
+            // --- surge onto ONE od pair (a real corridor-length trip):
+            // quarantine must keep portfolios diverse ---
+            int so = rng.NextInt(g.NodeCount), to = rng.NextInt(g.NodeCount);
+            for (int tries = 0; tries < 500; tries++)
+            {
+                float dff = Reference.Dijkstra(g, so, to, e => g.TimeFree[e]);
+                if (!float.IsPositiveInfinity(dff) && dff > 200f) break;
+                so = rng.NextInt(g.NodeCount); to = rng.NextInt(g.NodeCount);
+            }
+            int thinServed = 0;
+            for (int i = 0; i < 40; i++)
+            {
+                var req = new TripRequest
+                {
+                    AgentId = i, Origin = so, Destination = to,
+                    Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
+                    Seed = seed ^ (ulong)(i * 977),
+                };
+                var plan = planner.PlanFixed(in req);
+                if (plan.ServedFromCache && plan.Entry != null && !plan.Entry.Covered && plan.Alts.Count < 2)
+                    thinServed++;
+            }
+            Check(thinServed == 0, $"quarantine served {thinServed} thin portfolios from an uncovered entry during a surge");
+
+            // --- zonal traffic: cache must actually get hits, and cached plans
+            // must stay certificate-sound ---
+            int badLb = 0;
+            for (int i = 0; i < 150; i++)
+            {
+                int s = rng.NextInt(g.NodeCount), t = rng.NextInt(g.NodeCount);
+                for (int rep = 0; rep < 3; rep++) // repeat OD pairs => hits
+                {
+                    var req = new TripRequest
+                    {
+                        AgentId = i, Origin = s, Destination = t,
+                        Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
+                        Seed = seed ^ (ulong)(i * 31 + rep),
+                    };
+                    var plan = planner.PlanFixed(in req);
+                    if (plan.Unreachable || !plan.HasPlan) continue;
+                    if (rep == 2 && plan.ServedFromCache)
+                    {
+                        var alphaLocal = req.Alpha;
+                        float opt = Reference.Dijkstra(g, s, t, e => AnchorGrid.AlphaWeightLive(g, e, in alphaLocal));
+                        if (plan.CertLowerBound > opt * (1 + 1e-3f)) badLb++;
+                    }
+                }
+            }
+            Check(planner.Stats.ServedFromCache > 50, $"cache rarely serves ({planner.Stats.ServedFromCache} hits) under repeating demand");
+            Check(badLb == 0, $"cache-served plans with unsound certificate LB: {badLb}");
+
+            // --- async repair: no synchronous repair searches; demand -> exploration -> donation ---
+            Check(planner.Stats.RepairSearches == 0, "async mode still ran synchronous repair searches");
+            long demand = planner.Stats.ExplorationDemandLogged;
+            int tasks = planner.RunExploration(64);
+            Check(demand == 0 || tasks > 0, $"exploration demand logged ({demand}) but no exploration tasks ran");
+            Console.WriteLine($"  cache: hits={cache.Hits} misses={cache.Misses} entries={cache.EntryCount} " +
+                              $"servedFromCache={planner.Stats.ServedFromCache} quarantineDiversions={planner.Stats.QuarantineDiversions} " +
+                              $"explored={tasks} donated={planner.Stats.ExplorationDonated}");
+        }
+
         private static void VerifySimSmoke(ulong seed)
         {
             var city = SyntheticCity.Build(28, 28, 1000, 100, seed);
@@ -412,9 +486,11 @@ namespace CS2Path.Harness
             sim.Run(600);
             var st = sim.Planner!.Stats;
             var us = sim.Upd!.Stats;
-            Console.WriteLine($"  smoke: {sim.FinishedTrips}/{sim.Trips.Count} arrived, reprices={us.Reprices}, switches={us.Switches}, regens={us.Regenerations}, softClosed={sim.Detector!.SoftClosedCount}");
+            Console.WriteLine($"  smoke: {sim.FinishedTrips}/{sim.Trips.Count} arrived, reprices={us.Reprices}, switches={us.Switches}, " +
+                              $"regens={us.Regenerations}, decisionEvents={us.DecisionEvents}, cacheServed={st.ServedFromCache}, syncFallbacks={st.SyncFallbacks}");
             Check(sim.FinishedTrips > sim.Trips.Count * 0.7, $"too few arrivals ({sim.FinishedTrips}/{sim.Trips.Count})");
             Check(us.Reprices > 0, "update engine never re-priced");
+            Check(us.DecisionEvents > 0, "decision-point channel never fired");
         }
 
         private static bool Close(float a, float b, float tol = 1e-3f)

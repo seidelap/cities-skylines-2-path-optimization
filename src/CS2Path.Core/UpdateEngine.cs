@@ -12,6 +12,10 @@ namespace CS2Path.Core
         public int RouteVersion;        // bumps on every route switch (stale-index check)
         public float LastRemainingCost; // anchor units at last (re)price
         public bool Finished;
+        // decision-point trigger cursor (§4 L4 v2): next path index at which the
+        // agent re-evaluates its held branches; spacing set at registration
+        public int NextTriggerAt = int.MaxValue;
+        public int TriggerSpacing = int.MaxValue;
         // sim-owned movement state (harness):
         public int CurEdge = -1;        // edge currently being driven, -1 before departure
         public float EdgeTimeLeft;
@@ -26,7 +30,7 @@ namespace CS2Path.Core
         public float ImproveThreshold = 0.08f;
         public float RegionImproveMassSec = 30f;  // summed improvement (s) to wake a region
         public int MaxWakesPerTick = 4000;
-        public float SweepFraction = 0.003f;      // blind sweeper, fraction of agents per tick (plan: 0.1-0.5%)
+        public float SweepFraction = 0.001f;      // residual blind sweeper (§4 L4 v2: ~0.1%/tick safety net)
         public int QueuedHops = 2;                // agents this close to a closure wait instead of replanning
         public float EventGateFactor = 1.5f;      // notified upstream agents per tick ≈ gate * service rate
         public float ProbeDegradeFactor = 1.10f;  // whole-portfolio degradation triggering a probe
@@ -208,6 +212,16 @@ namespace CS2Path.Core
             if (!_wakeSet.Add(agent)) return false;
             _wakeQueue.Enqueue(agent);
             return true;
+        }
+
+        /// <summary>§4 L4 v2 channel 2: decision-point replanning. Fired when an
+        /// agent REACHES a branch point of its held route — computation only
+        /// where it is actionable, and arrival-ordered evaluation is the cohort
+        /// desynchronizer (each platoon member sees costs updated by the
+        /// diversions of those ahead). Routed through the same tiered refresh.</summary>
+        public void OnDecisionPoint(int agent)
+        {
+            if (Wake(agent)) Stats.DecisionEvents++;
         }
 
         /// <summary>Tiered refresh of woken agents, oldest wake first, bounded by
