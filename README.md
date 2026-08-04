@@ -99,6 +99,25 @@ Measured results: see [`RESULTS.md`](RESULTS.md).
   but cost updates land at refresh granularity, so a platoon's later members see
   the diversions of those ahead only across refresh boundaries.
 
+### Modeling constraints (documented decisions, not code)
+
+* **Transit time-dependence** — CCH requires time-independent edge costs; transit
+  legs use the frequency-based resolution (expected wait = headway/2). Real
+  limitation: no schedule-exact transfers. Schedule-based transit would need a
+  separate time-expanded layer stitched at mode-transfer nodes.
+* **Parking** — a capacity-constrained sub-destination between Layers 2 and 3
+  (choose a lot jointly with the route, spill to the next lot when full). Not
+  modeled; the bucket machinery is the natural host (lots as a destination
+  category with occupancy-driven attraction), future work.
+* **Corridor ratio fold-back** — calibrating edge sums by realized corridor
+  traversals (multiplicative correction at customization, shrunk toward 1.0 on
+  sparse corridors) matters where telemetry is partial, i.e. the real game's
+  lane graph. The harness observes every traveler at edge granularity, so folded
+  ratios are ~1.0 by construction; the harness instead measures the
+  realized-vs-predicted ratio per cluster entry (prediction bias), which is the
+  confidence input the predictive blend consumes. Fold-back lands with corridor
+  objects in the adapter.
+
 * **Turn costs / lane changes** — the core routes on a directed edge graph; the plan's
   lane-level treatment needs the reader adapter to expand the game's lane/turn graph into
   edge-based form (node = lane-end, edge = lane traversal or permitted turn). The routing

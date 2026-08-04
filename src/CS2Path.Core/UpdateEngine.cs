@@ -19,11 +19,13 @@ namespace CS2Path.Core
         public int NextTriggerAt = int.MaxValue;
         public int TriggerSpacing = int.MaxValue;
         public ulong LastCorridorCode;
+        public float PredictedSeconds;  // TimeLive sum of the plan at departure (telemetry)
         // sim-owned movement state (harness):
         public int CurEdge = -1;        // edge currently being driven, -1 before departure
         public float EdgeTimeLeft;
         public int QueuedTicks;
         public int DepartTick;
+        public int FinishTick = -1;
     }
 
     public sealed class UpdateConfig
@@ -255,7 +257,8 @@ namespace CS2Path.Core
             // Incumbent price: the true remaining cost of the path being driven.
             // (Re-pricing the chosen alternative as cur->via->dest would inflate
             // it once the agent has passed its via node.)
-            float curCost = _planner.RemainingPathCostBlended(plan.ChosenEdgePath, t.PathCursor, profile);
+            float blend = plan.StableBlend > 0 ? plan.StableBlend : 0f;
+            float curCost = _planner.RemainingPathCostBlended(plan.ChosenEdgePath, t.PathCursor, profile, blend);
 
             // §4.8 v2: refresh holdings from the shared entry — a via donated by
             // exploration (or another trip) reaches in-flight agents here.
@@ -268,7 +271,7 @@ namespace CS2Path.Core
             for (int i = 0; i < plan.Alts.Count; i++)
             {
                 if (i == plan.ChosenIdx) continue;
-                float c = _planner.RepriceAlternativeBlended(cur, plan.Alts[i], profile);
+                float c = _planner.RepriceAlternativeBlended(cur, plan.Alts[i], profile, blend);
                 Stats.Reprices++;
                 if (c < bestCost) { bestCost = c; bestIdx = i; }
             }

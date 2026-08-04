@@ -48,6 +48,13 @@ namespace CS2Path.Harness
                     Console.WriteLine("\nwrote results-sim.md");
                     return 0;
                 }
+                case "commute":
+                {
+                    var md = CommuteExperiment(opts, seed);
+                    File.WriteAllText("results-commute.md", md);
+                    Console.WriteLine("\nwrote results-commute.md");
+                    return 0;
+                }
                 case "all":
                 {
                     var sb = new StringBuilder(Header());
@@ -604,6 +611,144 @@ namespace CS2Path.Harness
             sb.AppendLine($"| unreachable-trip events | {ps.UnreachableTrips:N0} |");
             sb.AppendLine();
             Console.WriteLine($"  done in {wallS:N0}s: arrived={sim.FinishedTrips}/{sim.Trips.Count} planned={ps.TripsPlanned} switches={us.Switches}");
+            return sb.ToString();
+        }
+
+        // ==================================================================
+        /// <summary>
+        /// Register opportunity #1: adaptive departure timing. Arrival-constrained
+        /// commuters set depart = target arrival − (learned commute mean +
+        /// k_i·deviation) − jitter_i, learning from the cluster entries' realized
+        /// travel telemetry (register #2) with slow EMAs and per-agent
+        /// heterogeneity to prevent departure-herding. A/B against fixed
+        /// departures over D simulated days: expect lateness and peak
+        /// concentration to fall without a global scheduler (kills gap #5 at
+        /// the source).
+        /// </summary>
+        private static string CommuteExperiment(Dictionary<string, string> opts, ulong seed)
+        {
+            int cols = (int)GetOpt(opts, "cols", 120), rows = (int)GetOpt(opts, "rows", 120);
+            int commuters = (int)GetOpt(opts, "commuters", 10_000);
+            int days = (int)GetOpt(opts, "days", 8);
+            int dayTicks = (int)GetOpt(opts, "dayticks", 700);
+            var sb = new StringBuilder();
+            var city = SyntheticCity.Build(cols, rows, commuters, 500, seed);
+            var g = city.G;
+            var anchors = city.BuildAnchors(6, includeTypical: true);
+
+            // commuter population: zonal homes, concentrated work destinations,
+            // normal target-arrival times, heterogeneous risk factors + jitter
+            var rng0 = new SplitMix64(seed + 55);
+            int[] Pool(int center, int size)
+            {
+                var pool = new List<int> { center };
+                var q = new Queue<int>(); q.Enqueue(center);
+                var seen = new HashSet<int> { center };
+                while (q.Count > 0 && pool.Count < size)
+                {
+                    int v = q.Dequeue();
+                    for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++)
+                        if (seen.Add(g.Head[e])) { pool.Add(g.Head[e]); q.Enqueue(g.Head[e]); }
+                }
+                return pool.ToArray();
+            }
+            int H = 25, W = 6;
+            var homePools = new int[H][]; var workPools = new int[W][];
+            for (int z = 0; z < H; z++) homePools[z] = Pool(rng0.NextInt(g.NodeCount), 150);
+            for (int z = 0; z < W; z++) workPools[z] = Pool(rng0.NextInt(g.NodeCount), 200);
+            var home = new int[commuters]; var work = new int[commuters];
+            var target = new int[commuters]; var kRisk = new float[commuters]; var jit = new int[commuters];
+            for (int i = 0; i < commuters; i++)
+            {
+                home[i] = homePools[rng0.NextInt(H)][rng0.NextInt(150)];
+                work[i] = workPools[rng0.NextInt(W)][rng0.NextInt(200)];
+                double u1 = 1 - rng0.NextDouble(), u2 = rng0.NextDouble();
+                float gauss = (float)(Math.Sqrt(-2 * Math.Log(u1)) * Math.Cos(2 * Math.PI * u2));
+                target[i] = (int)(dayTicks * 0.45f + dayTicks * 0.06f * gauss);
+                kRisk[i] = 0.5f + 1.5f * rng0.NextFloat();
+                jit[i] = rng0.NextInt(7) - 3;
+            }
+
+            sb.AppendLine("## Adaptive departure timing (register opportunity #1)");
+            sb.AppendLine();
+            sb.AppendLine($"{commuters:N0} commuters, {days} days × {dayTicks} ticks ({cols}x{rows} city). " +
+                          "Adaptive: depart = target − (entry commute mean + k·deviation) − jitter, learned from " +
+                          "cluster-entry realized telemetry. Fixed: depart = target − 1.25×free-flow estimate − jitter.");
+            sb.AppendLine();
+            sb.AppendLine("| day | mode | mean travel (ticks) | mean lateness | mean \\|lateness\\| | >10 ticks late | depart std | arrive std |");
+            sb.AppendLine("|---|---|---|---|---|---|---|---|");
+
+            foreach (bool adaptive in new[] { false, true })
+            {
+                var eng = RoutingEngine.Build(g, anchors);
+                // reset live components between modes for fairness
+                Array.Copy(g.TimeFree, g.TimeLive, g.EdgeCount);
+                Array.Copy(g.TimeFree, g.TimeTypical, g.EdgeCount);
+                eng.Metrics.ResetAll(); eng.Metrics.FullCustomize();
+                var sim = TrafficSim.Create(g, city.JamCapacity, SimMode.Rebuild, eng);
+                sim.TicksPerDay = dayTicks;
+                sim.Planner!.Cfg.PenaltyIters = 1;
+                sim.Planner.Cache!.DirectGenBudget = 400; // warmup governor active
+                var ffCtx = eng.Query.CreateContext();
+                int ffK = anchors.ScenarioBlockStart(CS2Path.Core.Scenario.FreeFlow);
+                var est0 = new float[commuters];
+                for (int i = 0; i < commuters; i++)
+                    est0[i] = eng.Query.Distance(ffCtx, home[i], work[i], ffK) / sim.Dt; // ticks
+
+                int agentBase = 0;
+                var rng = new SplitMix64(seed + 99);
+                for (int day = 0; day < days; day++)
+                {
+                    int dayStart = day * dayTicks;
+                    for (int i = 0; i < commuters; i++)
+                    {
+                        int lead;
+                        var entry = adaptive ? sim.Planner.Cache.GetOrCreate(home[i], work[i], out _) : null;
+                        int bucket = sim.TodBucketOf(dayStart + target[i]);
+                        if (adaptive && entry != null && entry.RealizedCount[bucket] >= 3)
+                            lead = (int)((entry.RealizedMean[bucket] + kRisk[i] * entry.RealizedDev[bucket]) / sim.Dt);
+                        else
+                            lead = (int)(est0[i] * 1.25f);
+                        int depart = Math.Max(dayStart + 1, dayStart + target[i] - lead - jit[i]);
+                        sim.AddTrip(depart, new TripRequest
+                        {
+                            AgentId = agentBase + i, Origin = home[i], Destination = work[i],
+                            Alpha = city.Citizens[i % city.Citizens.Length],
+                            Seed = seed ^ (ulong)((agentBase + i) * 6364136223846793005L),
+                        });
+                    }
+                    sim.Run(dayTicks);
+
+                    // per-day stats over this day's agents
+                    double tSum = 0, lSum = 0, lAbs = 0, dSum = 0, dSq = 0, aSum = 0, aSq = 0;
+                    int n = 0, late = 0, arrived = 0;
+                    for (int i = 0; i < commuters; i++)
+                    {
+                        var t = sim.Trips[agentBase + i];
+                        if (!t.Finished || t.FinishTick < 0) continue;
+                        arrived++;
+                        double travel = t.FinishTick - t.DepartTick;
+                        double lateness = t.FinishTick - (dayStart + target[i]);
+                        tSum += travel; lSum += lateness; lAbs += Math.Abs(lateness);
+                        if (lateness > 10) late++;
+                        dSum += t.DepartTick; dSq += (double)t.DepartTick * t.DepartTick;
+                        aSum += t.FinishTick; aSq += (double)t.FinishTick * t.FinishTick;
+                        n++;
+                    }
+                    if (n > 0)
+                    {
+                        double dStd = Math.Sqrt(Math.Max(0, dSq / n - (dSum / n) * (dSum / n)));
+                        double aStd = Math.Sqrt(Math.Max(0, aSq / n - (aSum / n) * (aSum / n)));
+                        string mode = adaptive ? "adaptive" : "fixed";
+                        sb.AppendLine($"| {day} | {mode} | {tSum / n:0.0} | {lSum / n:+0.0;-0.0} | {lAbs / n:0.0} | {(double)late / n:P1} | {dStd:0.0} | {aStd:0.0} |");
+                        Console.WriteLine($"  {mode} day {day}: travel={tSum / n:0.0} late={lSum / n:+0.0;-0.0} |late|={lAbs / n:0.0} >10={((double)late / n):P1} arrived={arrived}");
+                    }
+                    agentBase += commuters;
+                }
+            }
+            sb.AppendLine();
+            sb.AppendLine("Adaptive departures learn from the same shared telemetry that feeds predictive " +
+                          "pricing; per-agent heterogeneity (k, jitter) plus slow EMAs prevent departure-herding.");
             return sb.ToString();
         }
 

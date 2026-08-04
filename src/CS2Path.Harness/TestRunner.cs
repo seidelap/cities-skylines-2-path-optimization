@@ -55,6 +55,8 @@ namespace CS2Path.Harness
             VerifyEventDrivenBuckets(seed + 13);
             Console.WriteLine("verify: §4.9 cluster cache (hits, quarantine, async exploration)...");
             VerifyClusterCache(seed + 11);
+            Console.WriteLine("verify: cache remap after re-dissection, warmup governor, telemetry...");
+            VerifyCacheV4(seed + 14);
             Console.WriteLine("verify: end-to-end sim smoke test (switches, arrivals, decision points)...");
             VerifySimSmoke(seed + 10);
 
@@ -557,6 +559,81 @@ namespace CS2Path.Harness
             Console.WriteLine($"  cache: hits={cache.Hits} misses={cache.Misses} entries={cache.EntryCount} " +
                               $"servedFromCache={planner.Stats.ServedFromCache} quarantineDiversions={planner.Stats.QuarantineDiversions} " +
                               $"explored={tasks} donated={planner.Stats.ExplorationDonated}");
+        }
+
+        private static void VerifyCacheV4(ulong seed)
+        {
+            var city = SyntheticCity.Build(36, 36, 1500, 150, seed);
+            var g = city.G;
+            var anchors = city.BuildAnchors(5);
+            var eng = RoutingEngine.Build(g, anchors);
+            var planner = new TripPlanner(eng.Metrics, eng.Query);
+            var cache = new ClusterCache(eng.CellPaths);
+            planner.Cache = cache;
+            var rng = new SplitMix64(seed);
+            var ods = new List<(int s, int t)>();
+            for (int i = 0; i < 50; i++) ods.Add((rng.NextInt(g.NodeCount), rng.NextInt(g.NodeCount)));
+            int blendViolations = 0;
+            for (int rep = 0; rep < 3; rep++)
+                foreach (var (s, t) in ods)
+                {
+                    var plan = planner.PlanFixed(new TripRequest
+                    {
+                        Origin = s, Destination = t,
+                        Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
+                        Seed = seed ^ (ulong)(s * 31 + t),
+                    });
+                    if (plan.HasPlan && !plan.Unreachable &&
+                        (plan.StableBlend < planner.Cfg.TypicalBlend - 1e-4f ||
+                         plan.StableBlend > planner.Cfg.StableBlendMax + 1e-4f))
+                        blendViolations++;
+                    if (plan.Entry != null)
+                        cache.RecordRealized(plan.Entry, 0, 500f + 40f * rng.NextFloat(), 480f);
+                }
+            Check(blendViolations == 0, $"dynamic stable blend outside [floor, max] on {blendViolations} plans");
+
+            // telemetry sanity
+            var probe = cache.GetOrCreate(ods[0].s, ods[0].t, out _);
+            Check(probe.RealizedCount[0] >= 3, "entry telemetry not accumulating");
+            Check(probe.RealizedMean[0] > 400f && probe.RealizedMean[0] < 700f, $"realized mean off ({probe.RealizedMean[0]:0})");
+            float conf = probe.PredictionConfidence(0);
+            Check(conf > 0f && conf <= 1f, $"prediction confidence out of range ({conf})");
+            Check(probe.RatioCount > 0 && probe.RatioEma > 0.5f && probe.RatioEma < 2f, $"ratio EMA off ({probe.RatioEma:0.00})");
+
+            // gap #3: remap after re-dissection preserves route knowledge
+            var eng2 = RoutingEngine.Build(g, anchors);
+            var remapped = cache.RemapAfterRebuild(eng2.CellPaths, g.NodeCount);
+            Check(remapped.EntryCount == cache.EntryCount,
+                $"remap lost entries ({remapped.EntryCount}/{cache.EntryCount})");
+            int lost = 0;
+            foreach (var (s, t) in ods)
+            {
+                var e2 = remapped.GetOrCreate(s, t, out bool created);
+                if (created || (e2.Arrivals == 0 && e2.Vias.Count == 0)) lost++;
+            }
+            Check(lost == 0, $"remapped cache lost knowledge for {lost} OD pairs");
+
+            // gap #2: warmup governor bounds direct generations, thin service still plans
+            var planner2 = new TripPlanner(eng.Metrics, eng.Query);
+            var cache2 = new ClusterCache(eng.CellPaths) { DirectGenBudget = 3 };
+            planner2.Cache = cache2;
+            cache2.RefillDirectGenBudget();
+            int planned = 0;
+            for (int i = 0; i < 25; i++)
+            {
+                var plan = planner2.PlanFixed(new TripRequest
+                {
+                    Origin = rng.NextInt(g.NodeCount), Destination = rng.NextInt(g.NodeCount),
+                    Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
+                    Seed = seed ^ (ulong)(i * 7919),
+                });
+                if (plan.HasPlan) planned++;
+            }
+            Check(planner2.Stats.DirectGenerations <= 3,
+                $"governor exceeded budget ({planner2.Stats.DirectGenerations} direct gens)");
+            Check(cache2.GovernorDenials > 0, "governor never engaged on a cold storm");
+            Check(planned >= 23, $"thin service failed to plan under the governor ({planned}/25)");
+            Console.WriteLine($"  v4: conf={conf:0.00} ratio={probe.RatioEma:0.00} remapped={remapped.EntryCount} governorDenials={cache2.GovernorDenials}");
         }
 
         private static void VerifySimSmoke(ulong seed)

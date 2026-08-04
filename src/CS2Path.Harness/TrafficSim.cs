@@ -33,6 +33,7 @@ namespace CS2Path.Harness
         public float[] JamCap = null!;
 
         public float Dt = 4f;                   // sim-seconds per tick
+        public int TicksPerDay = int.MaxValue;  // time-of-day bucketing for entry telemetry
         public int RefreshInterval = 5;         // ticks between live-cost refreshes (Rebuild)
         public int SnapshotInterval = 40;       // ticks between snapshot updates (Vanilla lag)
         public int VanillaWaitReplanTicks = 25;
@@ -102,22 +103,36 @@ namespace CS2Path.Harness
         public void Run(int ticks, Action<int>? perTick = null)
         {
             // departures must be time-ordered or the cursor blocks on the first
-            // late trip and then releases everything as one synchronized flood
-            if (_scheduleCursor == 0 && Schedule.Count > 1)
+            // late trip and then releases everything as one synchronized flood.
+            // Sort the PENDING suffix each Run call so multi-day drivers can
+            // append the next day's trips between runs.
+            if (Schedule.Count - _scheduleCursor > 1)
             {
-                var order = new int[Schedule.Count];
-                for (int i = 0; i < order.Length; i++) order[i] = i;
-                var keys = DepartTicks.ToArray();
-                Array.Sort(keys, order); // stable enough: ties keep hash order deterministically per seed
-                var sched2 = new List<TripRequest>(Schedule.Count);
-                var ticks2 = new List<int>(Schedule.Count);
+                int pend = Schedule.Count - _scheduleCursor;
+                var order = new int[pend];
+                for (int i = 0; i < pend; i++) order[i] = _scheduleCursor + i;
+                var keys = new int[pend];
+                for (int i = 0; i < pend; i++) keys[i] = DepartTicks[_scheduleCursor + i];
+                Array.Sort(keys, order);
+                var sched2 = new List<TripRequest>(pend);
+                var ticks2 = new List<int>(pend);
                 foreach (var i in order) { sched2.Add(Schedule[i]); ticks2.Add(DepartTicks[i]); }
-                Schedule = sched2; DepartTicks = ticks2;
+                for (int i = 0; i < pend; i++)
+                {
+                    Schedule[_scheduleCursor + i] = sched2[i];
+                    DepartTicks[_scheduleCursor + i] = ticks2[i];
+                }
             }
             var sw = new Stopwatch();
             for (int i = 0; i < ticks; i++)
             {
                 Tick++;
+                if (Planner != null)
+                {
+                    Planner.Cache?.RefillDirectGenBudget();
+                    if (TicksPerDay != int.MaxValue)
+                        Planner.CurrentTodBucket = TodBucketOf(Tick);
+                }
                 sw.Restart(); Departures(); MsPlanning += sw.Elapsed.TotalMilliseconds;
                 sw.Restart(); Movement(); MsMovement += sw.Elapsed.TotalMilliseconds;
                 if (Mode == SimMode.Rebuild && Tick % RefreshInterval == 0) RefreshRebuild();
@@ -141,6 +156,9 @@ namespace CS2Path.Harness
                     if (!plan.HasPlan) { trip.Finished = true; Trips.Add(trip); continue; }
                     trip.CurrentNode = req.Origin;
                     trip.LastRemainingCost = plan.Alts[plan.ChosenIdx].AnchorCost;
+                    float pred = 0f;
+                    foreach (var e in plan.ChosenEdgePath) pred += G.TimeLive[e];
+                    trip.PredictedSeconds = pred;
                     ArmTriggers(trip);
                     Trips.Add(trip);
                     Upd!.RegisterRoute(Trips.Count - 1, trip);
@@ -280,6 +298,12 @@ namespace CS2Path.Harness
         /// stable under both — the herding A/B reports both regimes.</summary>
         public bool OccupancyProportionalSignal;
 
+        // EMA bank (register #4 / multi-timescale note): the queue-drain term is
+        // itself EMA-damped (fast member) before max-ing with the exit-measured
+        // medium EMA; the hours member is the typical scenario. One
+        // multiply-accumulate per edge per refresh.
+        private float[]? _drainEma;
+
         public float LiveEstimate(int e)
         {
             float cap = Math.Max(0.5f, G.Capacity[e]);
@@ -297,15 +321,27 @@ namespace CS2Path.Harness
                 float queueExcess = Math.Max(0f, Occ[e] - ffOcc);
                 drain = G.TimeFree[e] + queueExcess / cap * Dt;
             }
-            return Math.Max(LiveEst[e], drain);
+            _drainEma ??= (float[])G.TimeFree.Clone();
+            _drainEma[e] += 0.3f * (drain - _drainEma[e]);
+            return Math.Max(LiveEst[e], _drainEma[e]);
         }
+
+        public int TodBucketOf(int tick)
+            => TicksPerDay == int.MaxValue ? 0
+             : (int)((long)(tick % TicksPerDay) * ClusterEntry.TodBuckets / TicksPerDay);
 
         private void Finish(int agent, ActiveTrip t)
         {
             t.Finished = true;
             t.CurEdge = -1;
+            t.FinishTick = Tick;
             FinishedTrips++;
             TotalTravelTicks += Tick - t.DepartTick;
+            // realized travel-time telemetry on the cluster entry (register #2)
+            var cache = Planner?.Cache;
+            if (cache != null && t.Plan.Entry != null)
+                cache.RecordRealized(t.Plan.Entry, TodBucketOf(t.DepartTick),
+                    (Tick - t.DepartTick) * Dt, t.PredictedSeconds);
         }
 
         private void MaybeVanillaWaitReplan(int agent, ActiveTrip t)

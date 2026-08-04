@@ -39,6 +39,57 @@ namespace CS2Path.Core
         /// <summary>Covered ⇔ the discovery probability of an unseen route has
         /// fallen below ~2% (plan §4.9), with a minimum arrival mass.</summary>
         public bool Covered => Arrivals >= 20 && Singletons <= Math.Max(1.0, Arrivals) * 0.02;
+
+        // ---- realized travel-time telemetry (register opportunity #2) ----
+        // Jacobson/Karels-style EMA of mean and absolute deviation of REALIZED
+        // trip seconds, per time-of-day bucket, plus a realized/predicted ratio
+        // EMA (prediction bias under congestion dynamics — the confidence input
+        // for predictive pricing and adaptive departures). Edit-reset semantics
+        // inherited from the cache (entries remap/evict with topology).
+        public const int TodBuckets = 4;
+        public float[] RealizedMean = new float[TodBuckets];
+        public float[] RealizedDev = new float[TodBuckets];
+        public int[] RealizedCount = new int[TodBuckets];
+        public float RatioEma = 1f;      // realized / predicted-at-plan-time
+        public int RatioCount;
+
+        // representative OD pair: cell-key remap after re-dissection (gap #3)
+        public int RepS = -1, RepT = -1;
+
+        public void RecordRealized(int bucket, float realizedSec, float predictedSec)
+        {
+            const float A = 0.15f;       // slow EMA: learning must lag the swings it damps
+            bucket = Math.Max(0, Math.Min(TodBuckets - 1, bucket));
+            if (RealizedCount[bucket] == 0)
+            {
+                RealizedMean[bucket] = realizedSec;
+                RealizedDev[bucket] = realizedSec * 0.1f;
+            }
+            else
+            {
+                float err = realizedSec - RealizedMean[bucket];
+                RealizedMean[bucket] += A * err;
+                RealizedDev[bucket] += A * (Math.Abs(err) - RealizedDev[bucket]);
+            }
+            RealizedCount[bucket]++;
+            if (predictedSec > 1f && float.IsFinite(realizedSec))
+            {
+                float r = Math.Max(0.25f, Math.Min(4f, realizedSec / predictedSec));
+                RatioEma = RatioCount == 0 ? r : RatioEma + A * (r - RatioEma);
+                RatioCount++;
+            }
+        }
+
+        /// <summary>Confidence that this entry's typical/predicted costs are
+        /// trustworthy: high when realized deviation is small relative to mean
+        /// and there is sample support. Feeds the horizon blend weight.</summary>
+        public float PredictionConfidence(int bucket)
+        {
+            bucket = Math.Max(0, Math.Min(TodBuckets - 1, bucket));
+            if (RealizedCount[bucket] < 5) return 0f;
+            float cv = RealizedDev[bucket] / Math.Max(1f, RealizedMean[bucket]);
+            return 1f / (1f + 4f * cv);
+        }
     }
 
     /// <summary>
@@ -61,7 +112,32 @@ namespace CS2Path.Core
         public int MaxEntries = 200_000;
         public int EntryViaCap = 12;
 
-        public long Hits, Misses, Evictions;
+        /// <summary>Warm-up governor (gap #2): bounds simultaneous direct
+        /// generations so a cold cache (fresh load / post-rebuild) degrades to
+        /// thin-service + urgent exploration instead of a synchronized
+        /// generation storm — the failure mode this system exists to kill.
+        /// Refill each tick via RefillDirectGenBudget; &lt;0 = unlimited.</summary>
+        public int DirectGenBudget = -1;
+        private int _directGenTokens = int.MaxValue;
+
+        public long Hits, Misses, Evictions, GovernorDenials;
+
+        public void RefillDirectGenBudget()
+        {
+            _directGenTokens = DirectGenBudget < 0 ? int.MaxValue : DirectGenBudget;
+        }
+
+        /// <summary>Consume one direct-generation token; false = governor says
+        /// serve thin from held knowledge this tick.</summary>
+        public bool TryAcquireDirectGen()
+        {
+            lock (_sync)
+            {
+                if (_directGenTokens <= 0) { GovernorDenials++; return false; }
+                _directGenTokens--;
+                return true;
+            }
+        }
 
         public ClusterCache(NestedDissection.CellPath[] cells)
         {
@@ -110,7 +186,7 @@ namespace CS2Path.Core
                     return e;
                 }
                 if (_entries.Count >= MaxEntries) EvictOldestLocked();
-                e = new ClusterEntry { Level = (byte)level, LastUsedStamp = _stamp };
+                e = new ClusterEntry { Level = (byte)level, LastUsedStamp = _stamp, RepS = s, RepT = t };
                 _entries[key] = e;
                 created = true;
                 Misses++;
@@ -168,6 +244,12 @@ namespace CS2Path.Core
             }
         }
 
+        /// <summary>Thread-safe realized-travel recording (register #2).</summary>
+        public void RecordRealized(ClusterEntry e, int bucket, float realizedSec, float predictedSec)
+        {
+            lock (_sync) e.RecordRealized(bucket, realizedSec, predictedSec);
+        }
+
         /// <summary>Clear an entry's exploration demand after a task served it
         /// (demand re-accumulates from live gaps if the hole persists).</summary>
         public void DrainGap(ClusterEntry e)
@@ -203,6 +285,44 @@ namespace CS2Path.Core
                 if (all.Count > count) all.RemoveRange(count, all.Count - count);
                 return all;
             }
+        }
+
+        /// <summary>Gap #3: re-key every entry after a Layer-0 re-dissection —
+        /// background rebuilds renumber cells, and without matching, every major
+        /// road project would orphan the cache and reproduce the cold-start
+        /// storm. Entries re-key by their representative OD pair under the NEW
+        /// cell paths; vias that no longer exist are dropped; entries whose
+        /// endpoints vanished are evicted. Call with the rebuilt engine's
+        /// CellPaths and node count.</summary>
+        public ClusterCache RemapAfterRebuild(NestedDissection.CellPath[] newCells, int newNodeCount)
+        {
+            var fresh = new ClusterCache(newCells)
+            {
+                MaxEntries = MaxEntries, EntryViaCap = EntryViaCap, DirectGenBudget = DirectGenBudget,
+            };
+            lock (_sync)
+            {
+                foreach (var e in _entries.Values)
+                {
+                    if (e.RepS < 0 || e.RepS >= newNodeCount || e.RepT < 0 || e.RepT >= newNodeCount) continue;
+                    var moved = fresh.GetOrCreate(e.RepS, e.RepT, out bool created);
+                    if (!created) continue; // key collision: keep the first
+                    // carry route knowledge + telemetry; drop out-of-range vias
+                    moved.Vias.Clear();
+                    foreach (var v in e.Vias)
+                        if (v.Via >= 0 && v.Via < newNodeCount) moved.Vias.Add(v);
+                    foreach (var kv in e.ViaSeen)
+                        if (kv.Key >= 0 && kv.Key < newNodeCount) moved.ViaSeen[kv.Key] = kv.Value;
+                    moved.Arrivals = e.Arrivals; moved.Singletons = e.Singletons;
+                    moved.GapSum = e.GapSum; moved.GapCount = e.GapCount;
+                    Array.Copy(e.RealizedMean, moved.RealizedMean, ClusterEntry.TodBuckets);
+                    Array.Copy(e.RealizedDev, moved.RealizedDev, ClusterEntry.TodBuckets);
+                    Array.Copy(e.RealizedCount, moved.RealizedCount, ClusterEntry.TodBuckets);
+                    moved.RatioEma = e.RatioEma; moved.RatioCount = e.RatioCount;
+                }
+                fresh.Hits = Hits; fresh.Misses = Misses;
+            }
+            return fresh;
         }
 
         public long EstimatedBytes()

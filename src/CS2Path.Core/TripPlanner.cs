@@ -20,6 +20,15 @@ namespace CS2Path.Core
         /// anchor grid carries no Typical scenario. Certificates always run on
         /// pure live costs regardless.</summary>
         public float TypicalBlend = 0.3f;
+        /// <summary>Ceiling for the DYNAMIC stable blend: TypicalBlend is the
+        /// damping floor (equilibrium control — never best-respond to raw live
+        /// swings); confidence-weighted predictive pricing RAISES the blend
+        /// toward this ceiling for long trips on entries whose realized
+        /// deviation is low (register opportunity #3 / the EMA-bank scheme,
+        /// expressed additively over scenario lanes).</summary>
+        public float StableBlendMax = 0.8f;
+        /// <summary>Trip cost at which the horizon factor saturates (~15 min).</summary>
+        public float HorizonFullSec = 900f;
         public float CertTolerance = 2e-3f;   // certified-exact threshold (float slack)
         public float RepairGapThreshold = 0.01f;
         public int RepairMaxSettled = 2000;   // repair is best-effort: past this the potential was too loose
@@ -64,6 +73,10 @@ namespace CS2Path.Core
         /// exploration demand live on the entry.</summary>
         public ClusterEntry? Entry;
         public bool ServedFromCache;
+        /// <summary>Per-trip stable-scenario blend weight (damping floor raised
+        /// by horizon x prediction confidence). Used by choice AND Layer-4
+        /// switching comparisons.</summary>
+        public float StableBlend;
 
         public bool HasPlan => ChosenIdx >= 0;
     }
@@ -86,6 +99,9 @@ namespace CS2Path.Core
         /// <summary>§4.9 route-knowledge cache, shared across planners/threads.
         /// Null disables the cache layer (feature flag).</summary>
         public ClusterCache? Cache;
+        /// <summary>Current time-of-day bucket (0..ClusterEntry.TodBuckets-1),
+        /// set by the driver each tick; selects entry telemetry for confidence.</summary>
+        public int CurrentTodBucket;
 
         private readonly Graph _g;
         private readonly CchSkeleton _c;
@@ -216,8 +232,24 @@ namespace CS2Path.Core
                     }
                 }
             }
+            // warm-up governor (gap #2): a cold cache degrades to thin service +
+            // urgent exploration instead of a synchronized generation storm.
+            // Thin service still has this trip's own anchor-sweep meets.
+            if (needDirect && Cache != null && entry != null && !Cache.TryAcquireDirectGen())
+            {
+                entry.Urgent = true;
+                needDirect = false;
+            }
             if (!needDirect) { plan.ServedFromCache = true; Stats.ServedFromCache++; }
             else Stats.DirectGenerations++;
+
+            // dynamic stable blend (register #3): damping floor + horizon x confidence
+            {
+                float conf = entry?.PredictionConfidence(CurrentTodBucket) ?? 0f;
+                float horizon = Math.Min(1f, dNear / Math.Max(1f, Cfg.HorizonFullSec));
+                plan.StableBlend = Cfg.TypicalBlend
+                    + (Cfg.StableBlendMax - Cfg.TypicalBlend) * horizon * conf;
+            }
 
             // --- 2. Penalty-method extras on the nearest live anchor ---
             if (needDirect && vias.Count < Cfg.MaxAlternatives && Cfg.PenaltyIters > 0)
@@ -420,7 +452,7 @@ namespace CS2Path.Core
                 }
                 if (tooSimilar) continue;
                 plan.Alts.Add(cand.alt);
-                _choiceScores.Add(BlendedAlphaCost(cand.edges, in alpha, cand.alt.AlphaCost));
+                _choiceScores.Add(BlendedAlphaCost(cand.edges, in alpha, cand.alt.AlphaCost, plan.StableBlend > 0 ? plan.StableBlend : Cfg.TypicalBlend));
                 acceptedGeoms.Add(cand.edges);
                 var hs = new HashSet<int>();
                 foreach (var e in cand.edges) hs.Add(e);
@@ -435,8 +467,11 @@ namespace CS2Path.Core
         private readonly bool _hasTypical;
 
         private float BlendedAlphaCost(List<int> edges, in Preference alpha, float alphaLive)
+            => BlendedAlphaCost(edges, in alpha, alphaLive, Cfg.TypicalBlend);
+
+        private float BlendedAlphaCost(List<int> edges, in Preference alpha, float alphaLive, float wIn)
         {
-            float w = _hasTypical ? Cfg.TypicalBlend : 0f;
+            float w = _hasTypical ? wIn : 0f;
             if (w <= 0f) return alphaLive;
             float typ = 0f;
             foreach (var e in edges)
@@ -651,8 +686,8 @@ namespace CS2Path.Core
                 }
             }
 
-            // choice on stable-blended anchor scores
-            float w = Cfg.TypicalBlend;
+            // choice on stable-blended anchor scores (per-trip dynamic weight)
+            float w = plan.StableBlend > 0 ? plan.StableBlend : Cfg.TypicalBlend;
             int chosen = SelectByLogit(plan, i =>
                 float.IsPositiveInfinity(_cheapFf[i]) ? plan.Alts[i].AnchorCost
                     : (1 - w) * plan.Alts[i].AnchorCost + w * _cheapFf[i]);
@@ -703,9 +738,11 @@ namespace CS2Path.Core
         /// by TypicalBlend. Switching on raw live costs re-creates herding at
         /// decision points — the same lesson as choice-time blending.</summary>
         public float RepriceAlternativeBlended(int fromNode, in Alternative alt, int profile)
+            => RepriceAlternativeBlended(fromNode, in alt, profile, Cfg.TypicalBlend);
+
+        public float RepriceAlternativeBlended(int fromNode, in Alternative alt, int profile, float w)
         {
             float live = RepriceAlternative(fromNode, alt, profile);
-            float w = Cfg.TypicalBlend;
             if (w <= 0f || float.IsPositiveInfinity(live)) return live;
             int stableK = (_hasTypical ? _anchors.ScenarioBlockStart(Scenario.Typical)
                                        : _anchors.ScenarioBlockStart(Scenario.FreeFlow)) + profile;
@@ -719,8 +756,10 @@ namespace CS2Path.Core
         /// <summary>Blended remaining cost of the driven path (see
         /// RepriceAlternativeBlended): one pass summing both scenarios.</summary>
         public float RemainingPathCostBlended(List<int> path, int cursor, int profile)
+            => RemainingPathCostBlended(path, cursor, profile, Cfg.TypicalBlend);
+
+        public float RemainingPathCostBlended(List<int> path, int cursor, int profile, float w)
         {
-            float w = Cfg.TypicalBlend;
             int kLive = LiveMetric(profile);
             if (w <= 0f) return RemainingPathCost(path, cursor, profile);
             int kStable = (_hasTypical ? _anchors.ScenarioBlockStart(Scenario.Typical)
