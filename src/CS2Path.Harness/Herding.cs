@@ -139,9 +139,11 @@ namespace CS2Path.Harness
                 // utility on the rolling-average scenario — the stable signal
                 // that lets logit split cohorts instead of herding them onto
                 // the momentarily cheapest corridor
+                // measured knee: blend 0.6 / logit 0.10 gives the best damping
+                // (0.7/0.13 regresses — the response is non-monotonic)
                 sim.Planner.Cfg.EnvelopeEps = 0.60f;
-                sim.Planner.Cfg.LogitScale = 0.13f;
-                sim.Planner.Cfg.TypicalBlend = 0.7f;
+                sim.Planner.Cfg.LogitScale = 0.10f;
+                sim.Planner.Cfg.TypicalBlend = 0.6f;
             }
 
             // identical synchronized cohort demand in both modes

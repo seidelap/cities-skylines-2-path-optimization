@@ -233,7 +233,13 @@ namespace CS2Path.Harness
         /// same estimator.</summary>
         public float LiveEstimate(int e)
         {
-            float drain = G.TimeFree[e] + Occ[e] / Math.Max(0.5f, G.Capacity[e]) * Dt;
+            // queue delay = vehicles beyond free-flow transit, drained at the
+            // service rate; lightly-occupied edges report exactly free-flow so
+            // single-vehicle wobble never churns the customization layer
+            float cap = Math.Max(0.5f, G.Capacity[e]);
+            float ffOcc = cap * (G.TimeFree[e] / Dt);
+            float queueExcess = Math.Max(0f, Occ[e] - ffOcc);
+            float drain = G.TimeFree[e] + queueExcess / cap * Dt;
             return Math.Max(LiveEst[e], drain);
         }
 
