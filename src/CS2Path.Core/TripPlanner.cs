@@ -595,6 +595,51 @@ namespace CS2Path.Core
         public float ProbeDirect(int fromNode, int dest, int profile)
             => _q.Distance(_ctx, fromNode, dest, LiveMetric(profile));
 
+        /// <summary>§4.9: decision-point probes harvest their meeting nodes too —
+        /// every bidirectional search a trip runs samples the choice set.</summary>
+        public float ProbeAndHarvest(TripPlan plan, int fromNode, int dest, int profile)
+        {
+            int k = LiveMetric(profile);
+            float d = _q.Distance(_ctx, fromNode, dest, k);
+            if (Cache != null && plan.Entry != null && !float.IsPositiveInfinity(d) && _ctx.LastMeetNode >= 0)
+                Cache.Harvest(plan.Entry, _ctx.LastMeetNode, (short)k);
+            return d;
+        }
+
+        /// <summary>§4.8 v2: "individual holdings refresh from the shared tree at
+        /// the next decision point" — adopt the best entry via not already held,
+        /// if it prices within the envelope of the incumbent. Returns true if a
+        /// branch was adopted (caller re-runs its comparison).</summary>
+        public bool TryAdoptFromEntry(TripPlan plan, int fromNode, int profile, float incumbentCost)
+        {
+            if (Cache == null || plan.Entry == null || plan.Alts.Count >= Cfg.MaxAlternatives) return false;
+            int n = Cache.CopyVias(plan.Entry, _viaBuf);
+            if (n == 0) return false;
+            int bestVia = -1; float bestCost = float.PositiveInfinity;
+            for (int i = 0; i < n; i++)
+            {
+                int via = _viaBuf[i].Via;
+                bool held = false;
+                for (int j = 0; j < plan.Alts.Count; j++)
+                    if (plan.Alts[j].ViaNode == via) { held = true; break; }
+                if (held) continue;
+                int k = LiveMetric(profile);
+                float d1 = _q.Distance(_ctx, fromNode, via, k);
+                if (float.IsPositiveInfinity(d1)) continue;
+                float c = d1 + _q.Distance(_ctx, via, plan.Destination, k);
+                Stats.Reprices++;
+                if (c < bestCost) { bestCost = c; bestVia = via; }
+            }
+            if (bestVia < 0 || bestCost > incumbentCost * (1 + Cfg.EnvelopeEps)) return false;
+            plan.Alts.Add(new Alternative
+            {
+                ViaNode = bestVia, Destination = plan.Destination,
+                AnchorCost = bestCost, AlphaCost = bestCost, // anchor proxy: exact alpha materializes on expansion
+            });
+            Stats.EntryAdoptions++;
+            return true;
+        }
+
         /// <summary>True remaining cost of the CURRENT plan: sum of live anchor
         /// weights along the not-yet-driven path. Used by Layer 4 instead of the
         /// via re-price once the agent may have passed its via node — pricing
@@ -691,6 +736,24 @@ namespace CS2Path.Core
                         int via = RankMaxNode(_pathBuf2);
                         if (via >= 0 && Cache.Harvest(e, via, (short)nearK)) Stats.ExplorationDonated++;
                     }
+                    // ... plus a noise-perturbed draw (§4.9): mild multiplicative
+                    // edge noise recovers ε-dominated routes that are competitive
+                    // everywhere but win nowhere. Noise >= 1 keeps the base-metric
+                    // potential admissible.
+                    uint salt = (uint)(e.Arrivals * 2654435761u + 12345u);
+                    float dn = _astar.Search(_ctx, s, t, new[] { (nearK, 1f) },
+                        edge =>
+                        {
+                            float baseW = _anchors.EdgeWeight(_g, edge, nearK);
+                            float u = ((((uint)edge * 2654435761u) ^ salt) >> 16 & 0xFFFFu) / 65536f;
+                            return baseW * (1f + 0.15f * u);
+                        },
+                        _pathBuf2, Cfg.PenaltyMaxSettled);
+                    if (!float.IsPositiveInfinity(dn))
+                    {
+                        int via = RankMaxNode(_pathBuf2);
+                        if (via >= 0 && Cache.Harvest(e, via, (short)nearK)) Stats.ExplorationDonated++;
+                    }
                 }
                 e.Urgent = false;
                 done++;
@@ -734,7 +797,7 @@ namespace CS2Path.Core
         public List<double>? SyncFallbackTimesUs;
         public long ExplorationDemandLogged, ExplorationTasks, ExplorationDonated;
         public double ExplorationTimeUs;
-        public long DecisionEvents;
+        public long DecisionEvents, EntryAdoptions;
 
         public void AddFrom(Telemetry o)
         {
@@ -756,7 +819,7 @@ namespace CS2Path.Core
             ExplorationDemandLogged += o.ExplorationDemandLogged;
             ExplorationTasks += o.ExplorationTasks; ExplorationDonated += o.ExplorationDonated;
             ExplorationTimeUs += o.ExplorationTimeUs;
-            DecisionEvents += o.DecisionEvents;
+            DecisionEvents += o.DecisionEvents; EntryAdoptions += o.EntryAdoptions;
         }
     }
 }

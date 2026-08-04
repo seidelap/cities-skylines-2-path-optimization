@@ -13,9 +13,12 @@ namespace CS2Path.Core
         public float LastRemainingCost; // anchor units at last (re)price
         public bool Finished;
         // decision-point trigger cursor (§4 L4 v2): next path index at which the
-        // agent re-evaluates its held branches; spacing set at registration
+        // agent re-evaluates its held branches; spacing set at registration.
+        // LastCorridorCode fires triggers at corridor-cell boundaries — the
+        // structural branch points of the nest tree.
         public int NextTriggerAt = int.MaxValue;
         public int TriggerSpacing = int.MaxValue;
+        public ulong LastCorridorCode;
         // sim-owned movement state (harness):
         public int CurEdge = -1;        // edge currently being driven, -1 before departure
         public float EdgeTimeLeft;
@@ -254,6 +257,10 @@ namespace CS2Path.Core
             // it once the agent has passed its via node.)
             float curCost = _planner.RemainingPathCost(plan.ChosenEdgePath, t.PathCursor, profile);
 
+            // §4.8 v2: refresh holdings from the shared entry — a via donated by
+            // exploration (or another trip) reaches in-flight agents here.
+            _planner.TryAdoptFromEntry(plan, cur, profile, curCost);
+
             // Tier 1: re-price the rest of the portfolio — O(k) via re-pricing.
             int bestIdx = -1; float bestCost = float.PositiveInfinity;
             for (int i = 0; i < plan.Alts.Count; i++)
@@ -283,7 +290,7 @@ namespace CS2Path.Core
             // gone infinite — e.g. a closure severed every alternative.
             if (wholePortfolioDegraded || float.IsPositiveInfinity(incumbent))
             {
-                float probe = _planner.ProbeDirect(cur, plan.Destination, profile);
+                float probe = _planner.ProbeAndHarvest(plan, cur, plan.Destination, profile);
                 Stats.Probes++;
                 // Tier 3: full regeneration only if the probe beats the whole
                 // portfolio by the hysteresis margin.

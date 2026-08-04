@@ -81,6 +81,24 @@ Measured results: see [`RESULTS.md`](RESULTS.md).
 
 ## Known simplifications vs the full design
 
+### §4.9 / Layer 4 v2 (route-knowledge cache era)
+
+* **Per-nest lower bounds / branch-and-bound expansion** — decision-point refresh
+  re-prices all held branches (≤5 at ~190 µs each) instead of maintaining per-nest
+  bounds and expanding lazily; at this portfolio size the B&B saving is smaller than
+  its bookkeeping. The nest structure is used for nested logit and corridor triggers.
+* **Corridors as globally shared objects** — corridor identity is the via-node's
+  dissection cell (implicit); donation reaches one entry, not every entry referencing
+  the corridor. Global corridor objects (bound value, flow state, closure status)
+  are the designed extension for the mesoscopic model.
+* **Entry composition for long trips** (fine access + coarse corridor + fine egress)
+  — trips key into a single well-separated level; composition is future work.
+* **(via-node, metric-id)** — the metric-id is stored as provenance but re-pricing
+  currently always uses the agent's nearest live anchor.
+* **Platoon self-metering** — decision events are evaluated arrival-ordered (FIFO),
+  but cost updates land at refresh granularity, so a platoon's later members see
+  the diversions of those ahead only across refresh boundaries.
+
 * **Turn costs / lane changes** — the core routes on a directed edge graph; the plan's
   lane-level treatment needs the reader adapter to expand the game's lane/turn graph into
   edge-based form (node = lane-end, edge = lane traversal or permitted turn). The routing

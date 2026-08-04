@@ -216,6 +216,9 @@ namespace CS2Path.Harness
             int len = t.Plan.ChosenEdgePath.Count;
             t.TriggerSpacing = Math.Max(8, len / 6);
             t.NextTriggerAt = t.PathCursor + t.TriggerSpacing;
+            var cache = Planner?.Cache;
+            if (cache != null)
+                t.LastCorridorCode = cache.CorridorOf(t.CurrentNode, t.Plan.Entry?.Level ?? 6);
         }
 
         private void Enter(int agent, ActiveTrip t, int e)
@@ -225,10 +228,23 @@ namespace CS2Path.Harness
             t.CurrentNode = G.Head[e];
             t.PathCursor++;
             t.QueuedTicks = 0;
-            if (Upd != null && t.PathCursor >= t.NextTriggerAt && t.PathCursor < t.Plan.ChosenEdgePath.Count)
+            if (Upd != null && t.PathCursor < t.Plan.ChosenEdgePath.Count)
             {
-                t.NextTriggerAt = t.PathCursor + t.TriggerSpacing;
-                Upd.OnDecisionPoint(agent);
+                // structural branch points: corridor-cell boundary crossings
+                bool fire = false;
+                var cache = Planner?.Cache;
+                if (cache != null)
+                {
+                    ulong code = cache.CorridorOf(t.CurrentNode, t.Plan.Entry?.Level ?? 6);
+                    if (code != t.LastCorridorCode) { t.LastCorridorCode = code; fire = true; }
+                }
+                // virtual checkpoints on long trunks
+                if (t.PathCursor >= t.NextTriggerAt) fire = true;
+                if (fire)
+                {
+                    t.NextTriggerAt = t.PathCursor + t.TriggerSpacing;
+                    Upd.OnDecisionPoint(agent);
+                }
             }
             float density = Occ[e] / Math.Max(1f, JamCap[e]);
             t.EdgeTimeLeft = G.TimeFree[e] * (1f + 0.3f * density * density);
