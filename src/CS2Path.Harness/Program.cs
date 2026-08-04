@@ -465,6 +465,29 @@ namespace CS2Path.Harness
                 buckets.RefreshSlice(ctx, 500);
                 double sliceMs = sw.Elapsed.TotalMilliseconds;
 
+                // v3 event-driven refresh: quiescent (no metric change) vs after a
+                // clustered congestion delta — cost scales with change, not count
+                buckets.DriftSweepScans = int.MaxValue;
+                sw.Restart();
+                var (scanQ, refQ) = buckets.RefreshSliceEventDriven(ctx, city.Dests.Count, city.Dests.Count);
+                double quiescentMs = sw.Elapsed.TotalMilliseconds;
+                var chg = new List<int>();
+                int ctr = rng.NextInt(g.NodeCount);
+                var qq = new Queue<int>(); var seenN = new HashSet<int> { ctr }; qq.Enqueue(ctr);
+                while (qq.Count > 0 && chg.Count < 150)
+                {
+                    int v = qq.Dequeue();
+                    for (int e = g.OutStart[v]; e < g.OutStart[v + 1] && chg.Count < 150; e++)
+                    {
+                        g.TimeLive[e] *= 1.4f; chg.Add(e);
+                        if (seenN.Add(g.Head[e])) qq.Enqueue(g.Head[e]);
+                    }
+                }
+                eng.RefreshLive(chg);
+                sw.Restart();
+                var (scanD, refD) = buckets.RefreshSliceEventDriven(ctx, city.Dests.Count, city.Dests.Count);
+                double dirtyMs = sw.Elapsed.TotalMilliseconds;
+
                 var buf = new DestinationCandidate[8];
                 var scanLat = new List<double>(10000);
                 long entries = 0;
@@ -493,7 +516,9 @@ namespace CS2Path.Harness
                 sb.AppendLine("| measure | value |");
                 sb.AppendLine("|---|---|");
                 sb.AppendLine($"| bucket build, {city.Dests.Count:N0} destinations | {buildMs:N0} ms ({buckets.EntriesTotal:N0} entries) |");
-                sb.AppendLine($"| staggered refresh, 500 backward searches | {sliceMs:0.0} ms |");
+                sb.AppendLine($"| blind staggered refresh, 500 backward searches (v2, kept for A/B) | {sliceMs:0.0} ms |");
+                sb.AppendLine($"| event-driven refresh, quiescent full rotation of {city.Dests.Count:N0} dests | {quiescentMs:0.0} ms ({refQ} re-searches) |");
+                sb.AppendLine($"| event-driven refresh after a 150-edge congestion pocket | {dirtyMs:0.0} ms ({refD} of {scanD} scanned re-searched) |");
                 sb.AppendLine($"| shopper query (scan {city.Dests.Count / city.Dests.CategoryCount:N0} dests/category) | median {Pct(scanLat, 0.5):0.0} µs, p99 {Pct(scanLat, 0.99):N0} µs, {entries / 10000} entries scanned |");
                 sb.AppendLine($"| dispatch query (fleet of 200) | median {Pct(dispLat, 0.5):0.0} µs, p99 {Pct(dispLat, 0.99):N0} µs |");
                 sb.AppendLine();

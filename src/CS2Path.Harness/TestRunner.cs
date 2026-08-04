@@ -49,6 +49,10 @@ namespace CS2Path.Harness
             VerifyDispatch(seed + 9);
             Console.WriteLine("verify: soft-closure state machine...");
             VerifySoftClosure();
+            Console.WriteLine("verify: windowed detector == full-scan detector...");
+            VerifyWindowedDetector(seed + 12);
+            Console.WriteLine("verify: event-driven bucket refresh == blind refresh...");
+            VerifyEventDrivenBuckets(seed + 13);
             Console.WriteLine("verify: §4.9 cluster cache (hits, quarantine, async exploration)...");
             VerifyClusterCache(seed + 11);
             Console.WriteLine("verify: end-to-end sim smoke test (switches, arrivals, decision points)...");
@@ -392,6 +396,95 @@ namespace CS2Path.Harness
             occ[0] = 3f; outf[0] = 1.5f;
             for (int i = 0; i < 60 && g.ClosureMult[0] > 1f; i++) det.Tick(occ, outf, jam, rate, changed);
             Check(g.ClosureMult[0] == 1f && !det.IsSoftClosed(0), "soft closure did not release after recovery");
+        }
+
+        private static void VerifyWindowedDetector(ulong seed)
+        {
+            // identical random occupancy/outflow traces through a full-scan and a
+            // windowed detector (hot window = occ >= 0.5*jam) must produce
+            // bit-identical closure multipliers every tick
+            int E = 400;
+            var edges = new List<(int, int, float, float, float, float)>();
+            for (int e = 0; e < E; e++) edges.Add((e % 20, (e + 1) % 20, 10f, 0f, 0f, 2f));
+            var gA = Graph.Build(20, edges);
+            var gB = Graph.Build(20, edges);
+            var detA = new SoftClosureDetector(gA);
+            var detB = new SoftClosureDetector(gB);
+            var rng = new SplitMix64(seed);
+            var occ = new float[gA.EdgeCount]; var outf = new float[gA.EdgeCount];
+            var jam = new float[gA.EdgeCount]; var rate = new float[gA.EdgeCount];
+            for (int e = 0; e < gA.EdgeCount; e++) { jam[e] = 10f; rate[e] = 2f; }
+            var chA = new List<int>(); var chB = new List<int>();
+            var hot = new HashSet<int>();
+            int mismatches = 0;
+            for (int tick = 0; tick < 300; tick++)
+            {
+                for (int e = 0; e < gA.EdgeCount; e++)
+                {
+                    // random walk occupancy with sticky jams
+                    float delta = (rng.NextFloat() - 0.45f) * 4f;
+                    occ[e] = Math.Max(0f, Math.Min(10f, occ[e] + delta));
+                    outf[e] = occ[e] > 8.5f ? 0.05f * rng.NextFloat() : 0.5f + 1.5f * rng.NextFloat();
+                }
+                hot.Clear();
+                for (int e = 0; e < gA.EdgeCount; e++) if (occ[e] >= 0.5f * jam[e]) hot.Add(e);
+                chA.Clear(); chB.Clear();
+                detA.Tick(occ, outf, jam, rate, chA);
+                detB.TickWindowed(hot, occ, outf, jam, rate, chB);
+                for (int e = 0; e < gA.EdgeCount; e++)
+                    if (gA.ClosureMult[e] != gB.ClosureMult[e]) mismatches++;
+            }
+            Check(mismatches == 0, $"windowed detector diverged from full scan ({mismatches} edge-ticks)");
+            Check(detA.SoftClosedCount == detB.SoftClosedCount, "windowed detector SoftClosedCount diverged");
+        }
+
+        private static void VerifyEventDrivenBuckets(ulong seed)
+        {
+            var (city, eng) = BuildSmallCity(seed);
+            var g = city.G;
+            var ctx = eng.Query.CreateContext();
+            int refMetric = eng.Anchors.MetricIndex(0, Scenario.Live);
+            var buckets = DestinationBuckets.Build(eng.Query, ctx, city.Dests, refMetric);
+            var rng = new SplitMix64(seed);
+
+            // clustered congestion delta -> RefreshLive -> event-driven refresh
+            var changed = new List<int>();
+            int center = rng.NextInt(g.NodeCount);
+            var q2 = new Queue<int>(); var seen = new HashSet<int> { center };
+            q2.Enqueue(center);
+            while (q2.Count > 0 && changed.Count < 120)
+            {
+                int v = q2.Dequeue();
+                for (int e = g.OutStart[v]; e < g.OutStart[v + 1] && changed.Count < 120; e++)
+                {
+                    g.TimeLive[e] *= 1.6f;
+                    changed.Add(e);
+                    if (seen.Add(g.Head[e])) q2.Enqueue(g.Head[e]);
+                }
+            }
+            eng.RefreshLive(changed);
+            buckets.DriftSweepScans = int.MaxValue; // isolate the dirty-test path
+            var (scanned, refreshed) = buckets.RefreshSliceEventDriven(ctx, city.Dests.Count, city.Dests.Count);
+            buckets.RebuildBuckets();
+
+            // ground truth: buckets rebuilt from scratch on the same weights
+            var fresh = DestinationBuckets.Build(eng.Query, ctx, city.Dests, refMetric);
+            var bufA = new DestinationCandidate[8];
+            var bufB = new DestinationCandidate[8];
+            int bad = 0;
+            for (int i = 0; i < 80; i++)
+            {
+                int s = rng.NextInt(g.NodeCount);
+                int cat = rng.NextInt(city.Dests.CategoryCount);
+                int na = buckets.Scan(ctx, s, cat, bufA, 4);
+                int nb = fresh.Scan(ctx, s, cat, bufB, 4);
+                if (na != nb) { bad++; continue; }
+                for (int j = 0; j < na; j++)
+                    if (bufA[j].Dest != bufB[j].Dest || !Close(bufA[j].ScanCost, bufB[j].ScanCost, 2e-3f)) { bad++; break; }
+            }
+            Check(bad == 0, $"event-driven bucket refresh diverged from fresh build ({bad} scans)");
+            Check(refreshed < city.Dests.Count, $"event-driven refresh degenerated to full sweep ({refreshed}/{city.Dests.Count})");
+            Console.WriteLine($"  buckets: scanned={scanned} refreshed={refreshed}/{city.Dests.Count} after a localized congestion delta");
         }
 
         private static void VerifyClusterCache(ulong seed)

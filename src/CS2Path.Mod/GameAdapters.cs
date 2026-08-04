@@ -21,6 +21,14 @@ namespace CS2Path.Mod
     //    layer is independently revertible to vanilla behavior at runtime.
     //  * Version discipline: pin game version, per patch decompile + diff the
     //    components read below, repair, re-run the external harness, unpin.
+    //  * ORDERING CONSTRAINT (design v3, deliberate): decision-point events
+    //    at one decision node must be evaluated ARRIVAL-ORDERED — the platoon
+    //    self-metering property (each member sees costs updated by the
+    //    diversions of those ahead) and seeded determinism both depend on it.
+    //    In the Burst port this is a small serial section per node inside an
+    //    otherwise parallel job: group decision events by node, sort each
+    //    group by arrival stamp, parallelize ACROSS nodes, evaluate WITHIN a
+    //    node sequentially. Do not "fix" this into a fully parallel loop.
     // =====================================================================
 
     /// <summary>

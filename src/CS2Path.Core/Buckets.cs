@@ -47,9 +47,22 @@ namespace CS2Path.Core
         private List<(int dest, float dist)>?[][] _buckets = null!;
         private float[] _maxAttract = null!;
         private int _refreshCursor;
+        // event-driven refresh state: a destination's labels depend exactly on
+        // the up-arcs whose tails lie on its ancestor chain, so the customizer's
+        // per-node change epochs give an exact staleness test (memoized
+        // max-epoch along shared chain suffixes).
+        private int[] _lastRefreshEpoch = null!;
+        private int[] _sinceForced = null!;
+        private int[] _chainMax = null!, _chainStamp = null!, _chainBuf = null!;
+        private int _memoStamp;
+
+        /// <summary>Force-refresh a destination after this many event-driven
+        /// scans without a refresh — the slow drift sweep of plan §4.9 v3.</summary>
+        public int DriftSweepScans = 40;
 
         public long EntriesTotal;             // telemetry
         public long LastScanEntries;
+        public long ScannedForRefresh, RefreshedDirty, RefreshedDrift; // telemetry
 
         public static DestinationBuckets Build(CchQuery q, QueryContext ctx, DestinationSet dests, int refMetric)
         {
@@ -62,7 +75,12 @@ namespace CS2Path.Core
             b._maxAttract = new float[dests.CategoryCount];
             for (int d = 0; d < dests.Count; d++)
                 b._maxAttract[dests.Category[d]] = Math.Max(b._maxAttract[dests.Category[d]], dests.AttractionSeconds[d]);
+            b._lastRefreshEpoch = new int[dests.Count];
+            b._sinceForced = new int[dests.Count];
+            b._chainMax = new int[n]; b._chainStamp = new int[n]; b._chainBuf = new int[n];
             for (int d = 0; d < dests.Count; d++) b.RefreshDestination(ctx, d);
+            int epoch0 = q.M.ChangeEpoch;
+            for (int d = 0; d < dests.Count; d++) b._lastRefreshEpoch[d] = epoch0;
             b.RebuildBuckets();
             return b;
         }
@@ -81,15 +99,61 @@ namespace CS2Path.Core
             _labDists[d] = dists.ToArray();
         }
 
-        /// <summary>Staggered live refresh (plan: ~10k destinations over ~20
-        /// ticks). Re-runs backward searches for `count` destinations.</summary>
+        /// <summary>Blind staggered refresh (v2 behavior, kept for A/B): re-runs
+        /// backward searches for `count` destinations regardless of change —
+        /// linear in destination count.</summary>
         public void RefreshSlice(QueryContext ctx, int count)
         {
             for (int i = 0; i < count && Dests.Count > 0; i++)
             {
                 RefreshDestination(ctx, _refreshCursor);
+                _lastRefreshEpoch[_refreshCursor] = _q.M.ChangeEpoch;
+                _sinceForced[_refreshCursor] = 0;
                 _refreshCursor = (_refreshCursor + 1) % Dests.Count;
             }
+        }
+
+        /// <summary>Event-driven refresh (v3): scan up to scanCount destinations
+        /// in rotation, re-running a backward search ONLY for those whose
+        /// reachability cone was touched by a metric change since their last
+        /// refresh (exact test, see field docs) — plus a slow drift sweep.
+        /// Cost scales with actual change, not destination count.</summary>
+        public (int scanned, int refreshed) RefreshSliceEventDriven(QueryContext ctx, int scanCount, int maxRefreshes)
+        {
+            _memoStamp++;
+            int scanned = 0, refreshed = 0;
+            for (; scanned < scanCount && Dests.Count > 0 && refreshed < maxRefreshes; scanned++)
+            {
+                int d = _refreshCursor;
+                _refreshCursor = (_refreshCursor + 1) % Dests.Count;
+                bool drift = ++_sinceForced[d] >= DriftSweepScans;
+                bool dirty = drift || ChainMaxEpoch(Dests.Node[d]) > _lastRefreshEpoch[d];
+                if (!dirty) continue;
+                RefreshDestination(ctx, d);
+                _lastRefreshEpoch[d] = _q.M.ChangeEpoch;
+                _sinceForced[d] = 0;
+                refreshed++;
+                if (drift) RefreshedDrift++; else RefreshedDirty++;
+            }
+            ScannedForRefresh += scanned;
+            return (scanned, refreshed);
+        }
+
+        /// <summary>Max NodeArcChangeEpoch over the node's elimination-tree
+        /// ancestor chain, memoized per call batch (chains share suffixes).</summary>
+        private int ChainMaxEpoch(int v)
+        {
+            var c = _q.C; var epochs = _q.M.NodeArcChangeEpoch;
+            int len = 0, u = v;
+            while (u >= 0 && _chainStamp[u] != _memoStamp) { _chainBuf[len++] = u; u = c.EtParent[u]; }
+            int inherit = u >= 0 ? _chainMax[u] : 0;
+            for (int i = len - 1; i >= 0; i--)
+            {
+                int x = _chainBuf[i];
+                if (epochs[x] > inherit) inherit = epochs[x];
+                _chainMax[x] = inherit; _chainStamp[x] = _memoStamp;
+            }
+            return _chainMax[v];
         }
 
         /// <summary>Rebuild the shared per-node buckets from destination labels.

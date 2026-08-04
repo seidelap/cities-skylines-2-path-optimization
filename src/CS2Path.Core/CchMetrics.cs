@@ -25,6 +25,15 @@ namespace CS2Path.Core
 
         public long LastPartialArcsRecomputed; // telemetry
 
+        /// <summary>Monotonic epoch, bumped per (partial) customization. Together
+        /// with NodeArcChangeEpoch this is the "dirty flag" consumers use to
+        /// event-drive their own refreshes (Layer 3 buckets): a backward search
+        /// space rooted at d depends exactly on the up-arcs whose TAILS lie on
+        /// d's ancestor chain, so "max NodeArcChangeEpoch over my chain &gt; my
+        /// last refresh epoch" is an exact staleness test.</summary>
+        public int ChangeEpoch;
+        public int[] NodeArcChangeEpoch = null!;
+
         private bool[] _inQueue = null!;
         private LongHeap _heap;
         private float[] _scratchF = null!, _scratchB = null!;
@@ -43,6 +52,7 @@ namespace CS2Path.Core
             m._heap = new LongHeap(1024);
             m._scratchF = new float[m.K];
             m._scratchB = new float[m.K];
+            m.NodeArcChangeEpoch = new int[c.NodeCount];
             return m;
         }
 
@@ -88,6 +98,8 @@ namespace CS2Path.Core
         {
             var c = C;
             int n = c.NodeCount;
+            ChangeEpoch++;
+            Array.Fill(NodeArcChangeEpoch, ChangeEpoch); // everything (re)computed
             for (int r = 0; r < n; r++)
             {
                 int x = c.NodeAtRank[r];
@@ -154,6 +166,7 @@ namespace CS2Path.Core
         {
             var c = C;
             LastPartialArcsRecomputed = 0;
+            ChangeEpoch++;
             for (int i = 0; i < changedEdges.Count; i++)
             {
                 int arc = c.ArcOfEdge(changedEdges[i], out _);
@@ -166,6 +179,7 @@ namespace CS2Path.Core
                 LastPartialArcsRecomputed++;
                 if (RecomputeArc(a, kFrom, kCount))
                 {
+                    NodeArcChangeEpoch[c.UpTail[a]] = ChangeEpoch;
                     // Affected targets: for A in Up[v] (v = tail(a)), the arc
                     // between A and head(a), if present, has `a` as a triangle side.
                     int v = c.UpTail[a], w = c.UpHead[a];

@@ -61,6 +61,11 @@ namespace CS2Path.Harness
         private float[]? _lastNotifiedMult;
         private float[]? _typicalCustomized;
         private readonly List<int> _typicalChanged = new List<int>();
+        // hot window for the soft-closure detector (design v3): edges above half
+        // jam occupancy, maintained O(1) by the movement code that already
+        // touches them. Threshold 0.5 < OccupancyEnter 0.9 => provably lossless.
+        private readonly HashSet<int> _hotEdges = new HashSet<int>();
+        private const float HotFrac = 0.5f;
         private readonly List<int> _changedEdges = new List<int>();
         private readonly List<(int, float, float)> _changedTriples = new List<(int, float, float)>();
         private readonly List<int> _closureChanged = new List<int>();
@@ -195,6 +200,7 @@ namespace CS2Path.Harness
                     // exit network: arrival
                     ExitsThisTick[e]++; OutflowWindow[e]++;
                     Occ[e] = Math.Max(0, Occ[e] - 1);
+                    if (Occ[e] < HotFrac * JamCap[e]) _hotEdges.Remove(e);
                     MeasureExit(a, t, e);
                     Finish(a, t);
                     continue;
@@ -203,6 +209,7 @@ namespace CS2Path.Harness
                 if (Occ[nxt] >= JamCap[nxt]) { t.QueuedTicks++; MaybeVanillaWaitReplan(a, t); continue; } // spillback
                 ExitsThisTick[e]++; OutflowWindow[e]++;
                 Occ[e] = Math.Max(0, Occ[e] - 1);
+                if (Occ[e] < HotFrac * JamCap[e]) _hotEdges.Remove(e);
                 MeasureExit(a, t, e);
                 Enter(a, t, nxt);
             }
@@ -224,6 +231,7 @@ namespace CS2Path.Harness
         private void Enter(int agent, ActiveTrip t, int e)
         {
             Occ[e] += 1;
+            if (Occ[e] >= HotFrac * JamCap[e]) _hotEdges.Add(e);
             t.CurEdge = e;
             t.CurrentNode = G.Head[e];
             t.PathCursor++;
@@ -358,7 +366,7 @@ namespace CS2Path.Harness
                 var serviceRate = g.Capacity;
                 var outflowAvg = OutflowWindow;
                 for (int e = 0; e < outflowAvg.Length; e++) outflowAvg[e] /= RefreshInterval;
-                Detector.Tick(Occ, outflowAvg, JamCap, serviceRate, _closureChanged);
+                Detector.TickWindowed(_hotEdges, Occ, outflowAvg, JamCap, serviceRate, _closureChanged);
                 // notify Layer 4 on soft-closure onset AND on each doubling of the
                 // multiplier while the jam persists (post-onset registrants and
                 // sustained escalation both need wakes)
