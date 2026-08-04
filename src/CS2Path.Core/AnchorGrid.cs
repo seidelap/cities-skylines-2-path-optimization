@@ -136,33 +136,69 @@ namespace CS2Path.Core
         }
 
         /// <summary>
-        /// Conic decompositions alpha = sum(lambda_i * a_i), lambda >= 0, over
-        /// live-scenario profiles (plan §4.7). Returns candidate decompositions;
-        /// the certificate takes the one maximizing the lower bound (a dot
-        /// product each), which is the cheap stand-in for the "tiny LP".
-        /// Candidate 1: axes only (always exact: axes are unit vectors).
-        /// Candidate 2: max mass on the nearest non-axis profile + axis remainder.
+        /// The §4.7 "tiny LP": choose the conic decomposition
+        /// alpha = sum(lambda_i * a_i), lambda >= 0, that MAXIMIZES the lower
+        /// bound sum(lambda_i * dStar_i). In 3-component preference space the
+        /// LP optimum lies on a basis of at most 3 anchors, so we enumerate all
+        /// anchor triples (C(P,3) 3x3 solves via Cramer's rule — microseconds)
+        /// plus the always-feasible axes decomposition. A tight bound is what
+        /// makes natural certification common and keeps the repair potential
+        /// narrow. Returns the best LB; lambdaOut gets (profile, lambda) pairs.
         /// </summary>
-        public void DecomposeCandidates(in Preference alpha, List<(int profile, float lambda)[]> outCandidates)
+        public float BestLowerBound(in Preference alpha, float[] dStar, List<(int profile, float lambda)> lambdaOut)
         {
-            outCandidates.Clear();
-            outCandidates.Add(new[] { (0, alpha.Time), (1, alpha.Money), (2, alpha.Comfort) });
-
-            int near = NearestProfile(alpha);
-            if (near >= 3)
+            lambdaOut.Clear();
+            int P = Profiles.Length;
+            // axes baseline (profiles 0..2 are unit vectors: always exact)
+            float best = 0f;
+            bool ok = true;
+            float bAxes = 0f;
+            if (float.IsPositiveInfinity(dStar[0]) && alpha.Time > 0) ok = false;
+            if (float.IsPositiveInfinity(dStar[1]) && alpha.Money > 0) ok = false;
+            if (float.IsPositiveInfinity(dStar[2]) && alpha.Comfort > 0) ok = false;
+            if (ok)
             {
-                var a = Profiles[near];
-                float mu = float.MaxValue;
-                if (a.Time > 1e-9f) mu = Math.Min(mu, alpha.Time / a.Time);
-                if (a.Money > 1e-9f) mu = Math.Min(mu, alpha.Money / a.Money);
-                if (a.Comfort > 1e-9f) mu = Math.Min(mu, alpha.Comfort / a.Comfort);
-                if (mu > 0 && !float.IsInfinity(mu))
+                bAxes = alpha.Time * (alpha.Time > 0 ? dStar[0] : 0)
+                      + alpha.Money * (alpha.Money > 0 ? dStar[1] : 0)
+                      + alpha.Comfort * (alpha.Comfort > 0 ? dStar[2] : 0);
+                best = bAxes;
+                lambdaOut.Add((0, alpha.Time)); lambdaOut.Add((1, alpha.Money)); lambdaOut.Add((2, alpha.Comfort));
+            }
+
+            for (int i = 0; i < P; i++)
+            {
+                if (float.IsPositiveInfinity(dStar[i])) continue;
+                for (int j = i + 1; j < P; j++)
                 {
-                    float rt = alpha.Time - mu * a.Time, rm = alpha.Money - mu * a.Money, rc = alpha.Comfort - mu * a.Comfort;
-                    outCandidates.Add(new[] { (near, mu), (0, Math.Max(0, rt)), (1, Math.Max(0, rm)), (2, Math.Max(0, rc)) });
+                    if (float.IsPositiveInfinity(dStar[j])) continue;
+                    for (int k2 = j + 1; k2 < P; k2++)
+                    {
+                        if (float.IsPositiveInfinity(dStar[k2])) continue;
+                        var a = Profiles[i]; var b = Profiles[j]; var c = Profiles[k2];
+                        // Cramer: [a b c] * lambda = alpha
+                        double det = Det(a.Time, b.Time, c.Time, a.Money, b.Money, c.Money, a.Comfort, b.Comfort, c.Comfort);
+                        if (Math.Abs(det) < 1e-9) continue;
+                        double l1 = Det(alpha.Time, b.Time, c.Time, alpha.Money, b.Money, c.Money, alpha.Comfort, b.Comfort, c.Comfort) / det;
+                        double l2 = Det(a.Time, alpha.Time, c.Time, a.Money, alpha.Money, c.Money, a.Comfort, alpha.Comfort, c.Comfort) / det;
+                        double l3 = Det(a.Time, b.Time, alpha.Time, a.Money, b.Money, alpha.Money, a.Comfort, b.Comfort, alpha.Comfort) / det;
+                        if (l1 < -1e-5 || l2 < -1e-5 || l3 < -1e-5) continue; // outside the cone
+                        double lb = Math.Max(0, l1) * dStar[i] + Math.Max(0, l2) * dStar[j] + Math.Max(0, l3) * dStar[k2];
+                        if (lb > best)
+                        {
+                            best = (float)lb;
+                            lambdaOut.Clear();
+                            if (l1 > 1e-7) lambdaOut.Add((i, (float)l1));
+                            if (l2 > 1e-7) lambdaOut.Add((j, (float)l2));
+                            if (l3 > 1e-7) lambdaOut.Add((k2, (float)l3));
+                        }
+                    }
                 }
             }
+            return best;
         }
+
+        private static double Det(double a11, double a12, double a13, double a21, double a22, double a23, double a31, double a32, double a33)
+            => a11 * (a22 * a33 - a23 * a32) - a12 * (a21 * a33 - a23 * a31) + a13 * (a21 * a32 - a22 * a31);
     }
 
     /// <summary>Deterministic seeded RNG (plan §3: seeded noise, reproducible).</summary>

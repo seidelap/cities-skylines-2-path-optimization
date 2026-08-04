@@ -14,6 +14,8 @@ namespace CS2Path.Core
         public float EnvelopeEps = 0.30f;     // ε-envelope retention (§4.8)
         public float CertTolerance = 2e-3f;   // certified-exact threshold (float slack)
         public float RepairGapThreshold = 0.01f;
+        public int RepairMaxSettled = 4000;   // repair is best-effort: past this the potential was too loose
+        public int PenaltyMaxSettled = 30000;
         public bool UseFreeFlowDiversity = true;
     }
 
@@ -67,7 +69,7 @@ namespace CS2Path.Core
         private readonly List<int> _pathBuf2 = new List<int>(512);
         private readonly float[] _multiDist = new float[CchQuery.MaxBatch];
         private readonly int[] _multiMeet = new int[CchQuery.MaxBatch];
-        private readonly List<(int profile, float lambda)[]> _decomp = new List<(int, float)[]>(4);
+        private readonly List<(int profile, float lambda)> _lambda = new List<(int, float)>(4);
         private readonly Dictionary<int, float> _penalty = new Dictionary<int, float>(512);
         private readonly List<int> _sbP1 = new List<int>(512), _sbP2 = new List<int>(512);
 
@@ -148,7 +150,7 @@ namespace CS2Path.Core
                 {
                     float d = _astar.Search(_ctx, s, t, lam,
                         e => _anchors.EdgeWeight(_g, e, nearK) * (_penalty.TryGetValue(e, out var mu) ? mu : 1f),
-                        _pathBuf2);
+                        _pathBuf2, Cfg.PenaltyMaxSettled);
                     Stats.PenaltySearches++;
                     Stats.PenaltySettled += _astar.LastSettledCount;
                     if (float.IsPositiveInfinity(d)) break;
@@ -256,53 +258,45 @@ namespace CS2Path.Core
         private List<List<int>> _acceptedGeomsScratch = new List<List<int>>();
 
         /// <summary>§4.7: LB(alpha) = max over conic decompositions of
-        /// sum(lambda_i * d_i*). Equality with the best candidate certifies exact
-        /// optimality; otherwise the gap is bounded a posteriori, and the
-        /// uncertified tail runs one potential-guided repair A*.</summary>
+        /// sum(lambda_i * d_i*), with lambda chosen by the tiny LP
+        /// (AnchorGrid.BestLowerBound). Equality with the best candidate
+        /// certifies exact optimality; otherwise the gap is bounded a
+        /// posteriori, and the uncertified tail runs one budgeted
+        /// potential-guided repair A* — exact if it completes, in which case
+        /// the trip certifies post-repair.</summary>
         private void Certify(TripPlan plan, int s, int t)
         {
-            _anchors.DecomposeCandidates(in plan.Alpha, _decomp);
-            float lb = 0f;
-            (int, float)[]? bestDecomp = null;
-            foreach (var cand in _decomp)
-            {
-                float b = 0f; bool ok = true;
-                foreach (var (prof, lam) in cand)
-                {
-                    if (lam <= 0) continue;
-                    float d = plan.LiveAnchorDists[prof];
-                    if (float.IsPositiveInfinity(d)) { ok = false; break; }
-                    b += lam * d;
-                }
-                if (ok && b > lb) { lb = b; bestDecomp = cand; }
-            }
+            float lb = _anchors.BestLowerBound(in plan.Alpha, plan.LiveAnchorDists, _lambda);
             plan.CertLowerBound = lb;
-            if (lb <= 0f || bestDecomp == null) { plan.Certified = false; plan.CertGap = float.NaN; return; }
+            if (lb <= 0f || _lambda.Count == 0) { plan.Certified = false; plan.CertGap = float.NaN; return; }
             plan.CertGap = plan.BestAlphaCost / lb - 1f;
             plan.Certified = plan.CertGap <= Cfg.CertTolerance;
             if (plan.Certified) { Stats.CertifiedTrips++; return; }
             Stats.CertGapSum += plan.CertGap;
 
-            if (plan.CertGap > Cfg.RepairGapThreshold)
+            if (plan.CertGap > Cfg.RepairGapThreshold && _lambda.Count <= PotentialAStar.MaxLanes)
             {
-                // Repair: exact A* under true alpha, guided by the lambda potential.
-                int nLam = 0;
-                foreach (var (prof, lam) in bestDecomp) if (lam > 0) nLam++;
-                var lamArr = new (int metric, float lambda)[nLam];
-                int i = 0;
-                foreach (var (prof, lam) in bestDecomp)
-                    if (lam > 0) lamArr[i++] = (LiveMetric(prof), lam);
+                // Repair: exact A* under true alpha, guided by the LP lambda potential.
+                var lamArr = new (int metric, float lambda)[_lambda.Count];
+                for (int i = 0; i < _lambda.Count; i++)
+                    lamArr[i] = (LiveMetric(_lambda[i].profile), _lambda[i].lambda);
                 var alpha = plan.Alpha;
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 float d = _astar.Search(_ctx, s, t, lamArr,
-                    e => AnchorGrid.AlphaWeightLive(_g, e, in alpha), _pathBuf2);
+                    e => AnchorGrid.AlphaWeightLive(_g, e, in alpha), _pathBuf2, Cfg.RepairMaxSettled);
                 long dtTicks = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
                 plan.Repaired = true;
                 Stats.RepairSearches++;
                 Stats.RepairSettled += _astar.LastSettledCount;
                 Stats.RepairStopwatchTicks += dtTicks;
                 Stats.RepairTimesUs?.Add(dtTicks * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency);
-                if (!float.IsPositiveInfinity(d) && d < plan.BestAlphaCost * (1f - 1e-6f) && RankMaxNode(_pathBuf2) >= 0)
+                if (float.IsPositiveInfinity(d))
+                {
+                    // budget exhausted: keep the portfolio best, keep the gap bound
+                    Stats.RepairBudgetExhausted++;
+                    return;
+                }
+                if (d < plan.BestAlphaCost * (1f - 1e-6f) && RankMaxNode(_pathBuf2) >= 0)
                 {
                     // Self-correcting portfolio (§4.8): adopt the repaired route.
                     int via = RankMaxNode(_pathBuf2);
@@ -315,7 +309,7 @@ namespace CS2Path.Core
                     plan.BestAlphaCost = d;
                     Stats.RepairImproved++;
                 }
-                // Post-repair the best candidate IS the exact alpha-optimum.
+                // Repair completed => the best candidate IS the exact alpha-optimum.
                 plan.Certified = true;
                 Stats.CertifiedTrips++;
             }
@@ -387,7 +381,7 @@ namespace CS2Path.Core
     /// telemetry — a direct instrument for anchor-set / preference-distribution fit).</summary>
     public sealed class Telemetry
     {
-        public long TripsPlanned, CertifiedTrips, RepairSearches, RepairImproved;
+        public long TripsPlanned, CertifiedTrips, RepairSearches, RepairImproved, RepairBudgetExhausted;
         public long PenaltySearches, DisjointBackups, UnreachableTrips;
         public long RepairSettled, PenaltySettled;
         public double CertGapSum;
@@ -399,6 +393,7 @@ namespace CS2Path.Core
         {
             TripsPlanned += o.TripsPlanned; CertifiedTrips += o.CertifiedTrips;
             RepairSearches += o.RepairSearches; RepairImproved += o.RepairImproved;
+            RepairBudgetExhausted += o.RepairBudgetExhausted;
             PenaltySearches += o.PenaltySearches; DisjointBackups += o.DisjointBackups;
             UnreachableTrips += o.UnreachableTrips; RepairSettled += o.RepairSettled;
             PenaltySettled += o.PenaltySettled; CertGapSum += o.CertGapSum;

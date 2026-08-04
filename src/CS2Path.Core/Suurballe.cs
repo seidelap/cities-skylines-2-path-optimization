@@ -13,10 +13,10 @@ namespace CS2Path.Core
     /// </summary>
     public static class Suurballe
     {
-        public const float CorridorFactor = 2.0f;
+        public const float CorridorFactor = 1.5f;
         /// <summary>Hard cap on phase-1 settled nodes: backups are a per-trip
         /// nicety, not worth an unbounded search on city-scale graphs.</summary>
-        public const int MaxSettled = 60_000;
+        public const int MaxSettled = 25_000;
 
         /// <summary>Find two edge-disjoint s->t paths with small total weight.
         /// Returns false if no disjoint pair exists inside the corridor.</summary>

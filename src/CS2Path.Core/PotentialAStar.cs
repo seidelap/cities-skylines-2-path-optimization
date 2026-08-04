@@ -57,11 +57,14 @@ namespace CS2Path.Core
 
         /// <summary>Exact shortest path s->t under edgeWeight, guided by the
         /// lambda-combined anchor potential. Returns distance (or +inf) and
-        /// fills edgePathOut in travel order.</summary>
+        /// fills edgePathOut in travel order. maxSettled bounds the search:
+        /// past it the result is +inf (best-effort semantics — callers keep
+        /// their portfolio incumbent and its gap bound).</summary>
         public float Search(QueryContext qctx, int s, int t,
                             (int metric, float lambda)[] lambda,
                             Func<int, float> edgeWeight,
-                            List<int> edgePathOut)
+                            List<int> edgePathOut,
+                            int maxSettled = int.MaxValue)
         {
             edgePathOut.Clear();
             int L = lambda.Length;
@@ -99,6 +102,7 @@ namespace CS2Path.Core
                 _settled[v] = true; _settledStamp[v] = stamp;
                 LastSettledCount++;
                 if (v == t) break;
+                if (LastSettledCount > maxSettled) return float.PositiveInfinity;
                 float gv = _g[v];
                 for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++)
                 {

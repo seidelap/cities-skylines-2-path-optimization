@@ -167,6 +167,33 @@ namespace CS2Path.Harness
                     else arcs1000 += eng.Metrics.LastPartialArcsRecomputed;
                 }
             }
+            // clustered case: congestion is spatial — perturb ~150 edges around
+            // one center (BFS ball), the shape a real refresh delta has
+            var partialClustered = new List<double>();
+            long arcsClustered = 0;
+            for (int round = 0; round < Rounds; round++)
+            {
+                changed.Clear();
+                int center = rng.NextInt(g.NodeCount);
+                var q2 = new Queue<int>(); var seen = new HashSet<int> { center };
+                q2.Enqueue(center);
+                while (q2.Count > 0 && changed.Count < 150)
+                {
+                    int v = q2.Dequeue();
+                    for (int e = g.OutStart[v]; e < g.OutStart[v + 1] && changed.Count < 150; e++)
+                    {
+                        float mult = 0.9f + 0.2f * rng.NextFloat();
+                        g.TimeLive[e] = Math.Max(g.TimeFree[e] * 0.5f, Math.Min(g.TimeFree[e] * 6f, g.TimeLive[e] * mult));
+                        changed.Add(e);
+                        if (seen.Add(g.Head[e])) q2.Enqueue(g.Head[e]);
+                    }
+                }
+                sw.Restart();
+                eng.RefreshLive(changed);
+                partialClustered.Add(sw.Elapsed.TotalMilliseconds);
+                arcsClustered += eng.Metrics.LastPartialArcsRecomputed;
+            }
+
             // worst case: 1000 edges jump 0.8x-2.4x at once
             changed.Clear();
             for (int i = 0; i < 1000; i++)
@@ -185,8 +212,9 @@ namespace CS2Path.Harness
             sb.AppendLine("| operation | time | §6 target |");
             sb.AppendLine("|---|---|---|");
             sb.AppendLine($"| full customization, all {K} metrics | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
-            sb.AppendLine($"| partial, 100 edges ±10% drift (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / Rounds:N0} arcs) | < 1 ms |");
-            sb.AppendLine($"| partial, 1000 edges ±10% drift (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / Rounds:N0} arcs) | — |");
+            sb.AppendLine($"| partial, 100 edges ±10% drift, scattered (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / Rounds:N0} arcs) | < 1 ms |");
+            sb.AppendLine($"| partial, 150 edges ±10% drift, clustered (one congestion pocket) | median {Pct(partialClustered, 0.5):0.00} ms, p99 {Pct(partialClustered, 0.99):0.00} ms ({arcsClustered / Rounds:N0} arcs) | < 1 ms |");
+            sb.AppendLine($"| partial, 1000 edges ±10% drift, scattered (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / Rounds:N0} arcs) | — |");
             sb.AppendLine($"| partial, 1000-edge large shock (0.8-2.4x) | {shockMs:N0} ms ({shockArcs:N0} arcs) | worst case, amortizable |");
             sb.AppendLine();
 
@@ -310,7 +338,7 @@ namespace CS2Path.Harness
             sb.AppendLine($"| mean portfolio size | {allAlts.DefaultIfEmpty(0).Average():0.0} alternatives | 3-5 |");
             sb.AppendLine($"| certified-exact fraction | {certFrac:P1} | ≥ 90% |");
             sb.AppendLine($"| mean certified gap (uncertified tail) | {meanGap:P2} | < 1% |");
-            sb.AppendLine($"| repair searches | {telemetry.RepairSearches:N0} ({(double)telemetry.RepairSearches / Math.Max(1, telemetry.TripsPlanned):P1} of trips) | 2-10% |");
+            sb.AppendLine($"| repair searches | {telemetry.RepairSearches:N0} ({(double)telemetry.RepairSearches / Math.Max(1, telemetry.TripsPlanned):P1} of trips, {telemetry.RepairBudgetExhausted:N0} hit budget) | 2-10% |");
             sb.AppendLine($"| repair p99 latency | {Pct(repairs, 0.99):N0} µs | < 500 µs |");
             sb.AppendLine($"| Suurballe backups | {telemetry.DisjointBackups:N0} | — |");
             sb.AppendLine($"| unreachable trips | {telemetry.UnreachableTrips:N0} | no increase vs vanilla (= genuine) |");
