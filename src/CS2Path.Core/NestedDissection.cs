@@ -56,14 +56,48 @@ namespace CS2Path.Core
                         if (g.Y[v] > maxY) maxY = g.Y[v];
                     }
                     bool splitX = (maxX - minX) >= (maxY - minY);
-                    // median split
                     var keys = new float[count];
                     for (int i = 0; i < count; i++) keys[i] = splitX ? g.X![set[i]] : g.Y![set[i]];
                     var idx = new int[count];
                     for (int i = 0; i < count; i++) idx[i] = i;
                     Array.Sort(keys, idx);
-                    int half = count / 2;
-                    for (int i = 0; i < count; i++) side[set[idx[i]]] = (byte)(i < half ? 0 : 1);
+
+                    // Min-crossing cut: instead of blindly cutting at the median,
+                    // pick the split position in the middle window that severs the
+                    // fewest edges (road networks concentrate crossings on
+                    // arterial lines; the sparse boundaries between districts are
+                    // where the small separators live).
+                    var posOf = new int[count];
+                    for (int i = 0; i < count; i++) posOf[idx[i]] = i;      // set-local index -> sorted position
+                    var setPos = new Dictionary<int, int>(count);
+                    for (int i = 0; i < count; i++) setPos[set[i]] = posOf[i];
+                    var cross = new int[count + 1];
+                    for (int i = 0; i < count; i++)
+                    {
+                        int v = set[i];
+                        int pv = posOf[i];
+                        for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++)
+                        {
+                            int w = g.Head[e];
+                            if (inSet[w] != stamp || !setPos.TryGetValue(w, out var pw)) continue;
+                            int plo = Math.Min(pv, pw), phi = Math.Max(pv, pw);
+                            if (plo == phi) continue;
+                            cross[plo + 1]++; cross[phi + 1]--;
+                        }
+                    }
+                    int loW = Math.Max(1, (int)(count * 0.30f)), hiW = Math.Min(count - 1, (int)(count * 0.70f));
+                    int bestS = count / 2, bestCross = int.MaxValue, run = 0;
+                    for (int s2 = 1; s2 <= hiW; s2++)
+                    {
+                        run += cross[s2];
+                        if (s2 < loW) continue;
+                        // prefer fewer crossings; tie-break toward balance
+                        if (run < bestCross || (run == bestCross && Math.Abs(s2 - count / 2) < Math.Abs(bestS - count / 2)))
+                        {
+                            bestCross = run; bestS = s2;
+                        }
+                    }
+                    for (int i = 0; i < count; i++) side[set[idx[i]]] = (byte)(i < bestS ? 0 : 1);
                 }
                 else
                 {

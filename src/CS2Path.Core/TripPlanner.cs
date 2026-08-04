@@ -65,6 +65,8 @@ namespace CS2Path.Core
 
         private readonly List<int> _pathBuf = new List<int>(512);
         private readonly List<int> _pathBuf2 = new List<int>(512);
+        private readonly float[] _multiDist = new float[CchQuery.MaxBatch];
+        private readonly int[] _multiMeet = new int[CchQuery.MaxBatch];
         private readonly List<(int profile, float lambda)[]> _decomp = new List<(int, float)[]>(4);
         private readonly Dictionary<int, float> _penalty = new Dictionary<int, float>(512);
         private readonly List<int> _sbP1 = new List<int>(512), _sbP2 = new List<int>(512);
@@ -103,15 +105,21 @@ namespace CS2Path.Core
                 return plan;
             }
 
-            // --- 1. Anchor-grid winners (plan: queries across the anchor grid) ---
+            // --- 1. Anchor-grid winners: ALL live anchor lanes in one batched
+            // sweep (the certificates reuse these exact distances) ---
             var vias = new List<(int via, bool backup)>(8);
             var viaSet = new HashSet<int>();
-            for (int p = 0; p < P; p++)
+            int liveStart = _anchors.ScenarioBlockStart(Scenario.Live);
+            for (int p0 = 0; p0 < P; p0 += CchQuery.MaxBatch)
             {
-                float d = _q.Distance(_ctx, s, t, LiveMetric(p));
-                plan.LiveAnchorDists[p] = d;
-                if (!float.IsPositiveInfinity(d) && viaSet.Add(_ctx.LastMeetNode))
-                    vias.Add((_ctx.LastMeetNode, false));
+                int chunk = Math.Min(CchQuery.MaxBatch, P - p0);
+                _q.DistanceMulti(_ctx, s, t, liveStart + p0, chunk, _multiDist, _multiMeet);
+                for (int p = 0; p < chunk; p++)
+                {
+                    plan.LiveAnchorDists[p0 + p] = _multiDist[p];
+                    if (!float.IsPositiveInfinity(_multiDist[p]) && viaSet.Add(_multiMeet[p]))
+                        vias.Add((_multiMeet[p], false));
+                }
             }
             float dNear = plan.LiveAnchorDists[plan.NearestProfile];
             if (float.IsPositiveInfinity(dNear))

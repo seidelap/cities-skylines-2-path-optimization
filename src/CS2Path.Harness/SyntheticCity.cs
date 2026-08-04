@@ -32,13 +32,19 @@ namespace CS2Path.Harness
             long PairKey(int a, int b) => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
 
             // Random holes in the local grid (parks, water). Arterials/highways kept.
+            // District walls: local streets do NOT cross superblock boundaries
+            // (every 32nd line) — only arterials do, as in real city layouts.
+            // This gives the road network its real hierarchical separator
+            // structure instead of full-grid treewidth.
             for (int r = 0; r < rows; r++)
                 for (int c = 0; c < cols; c++)
                 {
                     int v = r * cols + c;
-                    if (c + 1 < cols && !IsArterialRow(r) && rng.NextFloat() < holeFraction)
+                    if (c + 1 < cols &&
+                        (!IsArterialRow(r) && (rng.NextFloat() < holeFraction || (c + 1) % 32 == 0)))
                         removed.Add(PairKey(v, v + 1));
-                    if (r + 1 < rows && !IsArterialCol(c) && rng.NextFloat() < holeFraction)
+                    if (r + 1 < rows &&
+                        (!IsArterialCol(c) && (rng.NextFloat() < holeFraction || (r + 1) % 32 == 0)))
                         removed.Add(PairKey(v, v + cols));
                 }
 
