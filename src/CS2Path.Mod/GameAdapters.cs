@@ -23,6 +23,28 @@ namespace CS2Path.Mod
     //    Real phase names include Deserialize, Modification3/4/5,
     //    ModificationEnd, ToolUpdate, ApplyTool, Rendering, UIUpdate.
     //  * Network components live under `Game.Net`.
+    //  * MetricFeed source (verified from an ECS component dump):
+    //      Game.Net.LaneFlow { float4 m_Duration; float4 m_Distance; float2 m_Next; }
+    //        - the game's OWN rolling measurement of realized travel; live
+    //          seconds for a lane = length / (sum(m_Distance) / sum(m_Duration)).
+    //          Use this rather than modelling congestion ourselves.
+    //      Game.Net.Density { float m_Density; }   - occupancy, drives the
+    //          soft-closure detector's hot window and jam entry test.
+    //      Game.Net.LaneReservation { Entity m_Blocker; ... } - explicit blockage.
+    //  * PlanWriter target (verified):
+    //      Game.Pathfind.PathOwner { int m_ElementIndex; PathFlags m_State; }
+    //      Game.Pathfind.PathInformation { Entity m_Origin, m_Destination;
+    //          float m_Distance, m_Duration, m_TotalCost; PathMethod m_Methods;
+    //          PathFlags m_State; }
+    //  * Vanilla cost model to stay consistent with (verified):
+    //      Game.Prefabs.PathfindCarData { PathfindCosts m_DrivingCost,
+    //          m_TurningCost, m_UnsafeTurningCost, m_UTurnCost,
+    //          m_UnsafeUTurnCost, m_LaneCrossCost, m_ParkingCost, m_SpawnCost,
+    //          m_ForbiddenCost }
+    //      plus PathfindPedestrianData / PathfindTrackData /
+    //      PathfindTransportData / PathfindConnectionData. These are exactly the
+    //      per-action costs plan §1.1 describes, so our money/comfort components
+    //      should be derived from them rather than invented.
     //  * The project builds against the official toolchain via CSII_TOOLPATH ->
     //    Mod.props / Mod.targets (see CS2Path.Mod.csproj), NOT hand-rolled
     //    HintPaths into Cities2_Data\Managed.

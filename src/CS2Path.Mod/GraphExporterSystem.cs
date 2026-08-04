@@ -77,6 +77,11 @@ namespace CS2Path.Mod
         /// plausible-looking graph.</summary>
         public string LastDiagnostics { get; private set; } = "";
 
+        // Retained from the last Capture() so live traffic samples can be
+        // attributed to the right exported edge.
+        private readonly Dictionary<Entity, int> _laneToEdge = new Dictionary<Entity, int>();
+        private readonly List<float> _edgeLength = new List<float>();
+
         public CityExport Capture()
         {
             var em = EntityManager;
@@ -92,6 +97,8 @@ namespace CS2Path.Mod
             var nodeIndex = new Dictionary<PathNode, int>(entities.Length * 2);
             var xs = new List<float>(entities.Length * 2);
             var ys = new List<float>(entities.Length * 2);
+            _laneToEdge.Clear();
+            _edgeLength.Clear();
 
             int NodeOf(PathNode p, float3 pos)
             {
@@ -127,7 +134,7 @@ namespace CS2Path.Mod
                 float length = curve.m_Length;
                 if (!(length > 0.01f)) { skippedDegenerate++; continue; }
 
-                float speed = SpeedMetersPerSecond(em, prefabs[i].m_Prefab, carLane);
+                float speed = SpeedGameUnits(carLane) * SpeedScale;
                 if (!(speed > 0.1f)) { skippedDegenerate++; continue; }
 
                 var lane = lanes[i];
@@ -137,6 +144,8 @@ namespace CS2Path.Mod
 
                 bool highway = (carLane.m_Flags & CarLaneFlags.Highway) != 0;
 
+                _laneToEdge[e] = tail.Count;
+                _edgeLength.Add(length);
                 tail.Add(u);
                 head.Add(v);
                 timeFree.Add(length / speed);                     // seconds
@@ -184,26 +193,103 @@ namespace CS2Path.Mod
         }
 
         /// <summary>
-        /// Free-flow speed for a lane, in m/s.
+        /// Free-flow speed for a lane, in game speed units.
         ///
-        /// THIS IS THE ONE FIELD MOST LIKELY TO NEED A ONE-LINE FIX: the exact
-        /// speed member on CarLane / CarLaneData was not confirmed from source.
-        /// It is isolated here on purpose — a wrong name is a compile error on the
-        /// build machine, fixed in seconds, rather than a silent wrong metric.
-        /// Candidates seen in the wild: CarLane.m_SpeedLimit,
-        /// CarLane.m_DefaultSpeedLimit, CarLaneData.m_SpeedLimit.
-        /// CS2 stores speed in game units; the constant below converts to m/s.
+        /// Field names verified against a dump of the game's ECS component
+        /// definitions: Game.Net.CarLane really does carry BOTH m_SpeedLimit and
+        /// m_DefaultSpeedLimit (float). Game.Prefabs.CarLaneData does NOT carry a
+        /// speed at all — it holds m_NotTrackLanePrefab, m_NotBusLanePrefab,
+        /// m_RoadTypes, m_MaxSize — so an earlier fallback through it was simply
+        /// wrong and has been removed.
+        ///
+        /// The unit scale is still unconfirmed, which is why SpeedScale is a
+        /// field rather than a constant, and why CalibrateSpeedUnits() below
+        /// derives it from observed lane flow instead of guessing.
         /// </summary>
-        private static float SpeedMetersPerSecond(EntityManager em, Entity prefab, CarLane carLane)
+        private float SpeedGameUnits(CarLane carLane)
         {
-            const float GameSpeedToMetersPerSecond = 1f;  // verify: units may need scaling
-            const float FallbackSpeed = 11.1f;            // ~40 km/h
-
             float raw = carLane.m_SpeedLimit;
-            if (!(raw > 0f) && em.HasComponent<CarLaneData>(prefab))
-                raw = em.GetComponentData<CarLaneData>(prefab).m_SpeedLimit;
+            if (!(raw > 0f)) raw = carLane.m_DefaultSpeedLimit;
+            return raw;
+        }
 
-            return raw > 0f ? raw * GameSpeedToMetersPerSecond : FallbackSpeed;
+        /// <summary>Game-speed-units -> m/s. Starts at 1 and is corrected by
+        /// CalibrateSpeedUnits() from the game's own measured lane flow.</summary>
+        public float SpeedScale { get; private set; } = 1f;
+
+        /// <summary>
+        /// Resolve the speed-unit question empirically instead of asserting it.
+        ///
+        /// Game.Net.LaneFlow carries m_Duration and m_Distance (float4 rolling
+        /// windows) — the game's OWN measurement of how long vehicles took over
+        /// how far. On free-flowing lanes, distance/duration is the true speed in
+        /// m/s, so the median ratio of that to our declared speed limit is the
+        /// unit scale. Congested lanes are excluded via Game.Net.Density.
+        ///
+        /// Call once after a city has been running; it makes the export's
+        /// free-flow times physically meaningful without anyone having to know
+        /// CS2's internal units.
+        /// </summary>
+        public string CalibrateSpeedUnits()
+        {
+            var em = EntityManager;
+            using var entities = _laneQuery.ToEntityArray(Allocator.Temp);
+            var ratios = new List<float>();
+
+            for (int i = 0; i < entities.Length; i++)
+            {
+                var e = entities[i];
+                if (!em.HasComponent<CarLane>(e) || !em.HasComponent<LaneFlow>(e)) continue;
+                // Only near-empty lanes: on a congested lane the measured speed is
+                // the jam speed, not the free-flow speed.
+                if (em.HasComponent<Density>(e) && em.GetComponentData<Density>(e).m_Density > 0.05f) continue;
+
+                var flow = em.GetComponentData<LaneFlow>(e);
+                float dist = math.csum(flow.m_Distance);
+                float dur = math.csum(flow.m_Duration);
+                if (!(dist > 5f) || !(dur > 0.5f)) continue;
+
+                float declared = SpeedGameUnits(em.GetComponentData<CarLane>(e));
+                if (!(declared > 0.01f)) continue;
+
+                ratios.Add((dist / dur) / declared);   // observed m/s per game unit
+            }
+
+            if (ratios.Count < 25)
+                return $"speed calibration skipped: only {ratios.Count} free-flowing sampled lanes (need 25)";
+
+            ratios.Sort();
+            SpeedScale = ratios[ratios.Count / 2];
+            return $"speed scale = {SpeedScale:0.####} m/s per game unit " +
+                   $"(median of {ratios.Count} free-flowing lanes; 1.0 means the game already stores m/s)";
+        }
+
+        /// <summary>
+        /// Sample live congestion into the export's traffic trace, from the
+        /// game's own per-lane measurements rather than anything we model.
+        /// Verified components: Game.Net.LaneFlow(m_Duration,m_Distance) and
+        /// Game.Net.Density(m_Density). Call on a stagger while the city runs.
+        /// </summary>
+        public int SampleTraffic(int tick, GraphExporter sink)
+        {
+            var em = EntityManager;
+            int taken = 0;
+            foreach (var kv in _laneToEdge)
+            {
+                if (!em.Exists(kv.Key) || !em.HasComponent<LaneFlow>(kv.Key)) continue;
+                var flow = em.GetComponentData<LaneFlow>(kv.Key);
+                float dist = math.csum(flow.m_Distance);
+                float dur = math.csum(flow.m_Duration);
+                if (!(dist > 1f) || !(dur > 0.1f)) continue;
+
+                float observedSpeed = dist / dur;            // m/s, already real units
+                float length = _edgeLength[kv.Value];
+                if (!(observedSpeed > 0.1f) || !(length > 0f)) continue;
+
+                sink.RecordTraffic(tick, kv.Value, length / observedSpeed);
+                taken++;
+            }
+            return taken;
         }
     }
 #endif
