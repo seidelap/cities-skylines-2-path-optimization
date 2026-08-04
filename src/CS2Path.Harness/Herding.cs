@@ -131,6 +131,13 @@ namespace CS2Path.Harness
             var sim = TrafficSim.Create(sc.G, sc.Jam, mode, eng);
             sim.RefreshInterval = 5;
             sim.SnapshotInterval = 40;
+            if (sim.Planner != null)
+            {
+                // congestion swings make corridors comparable over a wide band:
+                // widen the envelope and the choice noise accordingly (§4 L4)
+                sim.Planner.Cfg.EnvelopeEps = 0.60f;
+                sim.Planner.Cfg.LogitScale = 0.10f;
+            }
 
             // identical synchronized cohort demand in both modes
             var rng = new SplitMix64(seed);

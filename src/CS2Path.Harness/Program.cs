@@ -439,6 +439,13 @@ namespace CS2Path.Harness
             var anchors = city.BuildAnchors(profiles);
             var eng = RoutingEngine.Build(city.G, anchors);
             var sim = TrafficSim.Create(city.G, city.JamCapacity, SimMode.Rebuild, eng);
+            // integration-sim planner config: per-trip micro-costs are measured
+            // precisely in `bench`; here the single-threaded harness stands in
+            // for Burst-parallel jobs, so plan with fewer expensive side
+            // searches to keep wall time sane at 100k trips
+            sim.Planner!.Cfg.PenaltyIters = 1;
+            sim.Planner.Cfg.RepairGapThreshold = 0.05f;
+            sim.Planner.Cfg.MaxAlternatives = 4;
             var rng = new SplitMix64(seed + 7);
             int n = city.G.NodeCount;
             int departWindow = (int)(ticks * 0.6);

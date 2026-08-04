@@ -206,7 +206,9 @@ namespace CS2Path.Core
         {
             var alpha = plan.Alpha;
             float bestNear = bestNearSeed;
-            var scored = new List<(Alternative alt, List<int> edges, float refTime)>(vias.Count);
+            float bestFf = float.PositiveInfinity;
+            int ffK = _anchors.ScenarioBlockStart(Scenario.FreeFlow) + plan.NearestProfile;
+            var scored = new List<(Alternative alt, List<int> edges, float refTime, float ffCost)>(vias.Count);
             var leg1Arcs = new List<(int arc, bool fwd)>(64);
 
             foreach (var (via, backup) in vias)
@@ -220,7 +222,15 @@ namespace CS2Path.Core
                 float costNear = d1 + d2;
                 if (float.IsPositiveInfinity(costNear)) continue;
                 if (costNear < bestNear) bestNear = costNear;
-                if (!backup && costNear > bestNear * Cfg.StretchMax) continue;
+                // Retention is judged ACROSS scenarios (§4.8): a corridor that is
+                // transiently jammed (bad live cost) but structurally sound (good
+                // free-flow cost) stays in the portfolio — collapsing to the
+                // momentarily-cheapest corridor is precisely the herding failure.
+                float ffCost = _q.Distance(_ctx, s, via, ffK) + _q.Distance(_ctx, via, t, ffK);
+                if (ffCost < bestFf) bestFf = ffCost;
+                bool nearOk = costNear <= bestNear * Cfg.StretchMax;
+                bool ffOk = ffCost <= bestFf * Cfg.StretchMax;
+                if (!backup && !nearOk && !ffOk) continue;
 
                 var edges = new List<int>(256);
                 foreach (var (arc, fwd) in leg1Arcs) _q.UnpackArc(_ctx.UnpackStack, arc, fwd, nearK, edges);
@@ -237,12 +247,14 @@ namespace CS2Path.Core
                     ViaNode = via, Destination = t,
                     AnchorCost = costNear, AlphaCost = alphaCost,
                     IsDisjointBackup = backup,
-                }, edges, refTime));
+                }, edges, refTime, ffCost));
             }
             if (scored.Count == 0) return;
 
             scored.Sort((a, b) => a.alt.AlphaCost.CompareTo(b.alt.AlphaCost));
             float bestAlpha = scored[0].alt.AlphaCost;
+            float bestFfScored = float.PositiveInfinity;
+            foreach (var cand in scored) if (cand.ffCost < bestFfScored) bestFfScored = cand.ffCost;
 
             // Overlap filter against already-accepted alternatives (shared live-time share).
             var acceptedEdges = new List<HashSet<int>>();
@@ -252,8 +264,11 @@ namespace CS2Path.Core
             {
                 if (plan.Alts.Count >= Cfg.MaxAlternatives) break;
                 bool isBackup = cand.alt.IsDisjointBackup;
-                // ε-envelope retention (§4.8): portfolios shrink where one route dominates.
-                if (!isBackup && plan.Alts.Count > 0 && cand.alt.AlphaCost > bestAlpha * (1 + Cfg.EnvelopeEps)) continue;
+                // ε-envelope retention (§4.8), across scenarios: keep candidates
+                // within (1+ε) of the best under live OR free-flow.
+                bool liveIn = cand.alt.AlphaCost <= bestAlpha * (1 + Cfg.EnvelopeEps);
+                bool ffIn = cand.ffCost <= bestFfScored * (1 + Cfg.EnvelopeEps);
+                if (!isBackup && plan.Alts.Count > 0 && !liveIn && !ffIn) continue;
                 bool tooSimilar = false;
                 if (!isBackup)
                 {

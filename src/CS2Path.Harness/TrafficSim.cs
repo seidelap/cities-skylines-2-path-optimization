@@ -92,6 +92,19 @@ namespace CS2Path.Harness
 
         public void Run(int ticks, Action<int>? perTick = null)
         {
+            // departures must be time-ordered or the cursor blocks on the first
+            // late trip and then releases everything as one synchronized flood
+            if (_scheduleCursor == 0 && Schedule.Count > 1)
+            {
+                var order = new int[Schedule.Count];
+                for (int i = 0; i < order.Length; i++) order[i] = i;
+                var keys = DepartTicks.ToArray();
+                Array.Sort(keys, order); // stable enough: ties keep hash order deterministically per seed
+                var sched2 = new List<TripRequest>(Schedule.Count);
+                var ticks2 = new List<int>(Schedule.Count);
+                foreach (var i in order) { sched2.Add(Schedule[i]); ticks2.Add(DepartTicks[i]); }
+                Schedule = sched2; DepartTicks = ticks2;
+            }
             var sw = new Stopwatch();
             for (int i = 0; i < ticks; i++)
             {
