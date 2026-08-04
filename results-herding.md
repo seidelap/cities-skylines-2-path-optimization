@@ -10,12 +10,12 @@ gridlock. The rebuild is stable under BOTH regimes.
 | signal regime | mode | oscillation (std of corridor share) | mean travel (ticks) |
 |---|---|---|---|
 | fast | vanilla | 0.4178 | 78.7 |
-| fast | **rebuild** | **0.1331** | **69.1** |
+| fast | **rebuild** | **0.0686** | **69.0** |
 | slow | vanilla | 0.0000 (gridlocked) | 181.8 |
-| slow | **rebuild** | **0.0466** | **69.0** |
+| slow | **rebuild** | **0.0450** | **69.0** |
 
-**Fast regime: oscillation amplitude 3.1× below vanilla** (§6 target ≥ 5×).
-**Slow regime: vanilla collapses into gridlock (2.6× the rebuild's travel time); the rebuild stays near-stationary (0.0466).**
+**Fast regime: oscillation amplitude 6.1× below vanilla** (§6 target ≥ 5×).
+**Slow regime: vanilla collapses into gridlock (2.6× the rebuild's travel time); the rebuild stays near-stationary (0.0450).**
 
 The damping comes from the §4 trio — logit noise over genuinely comparable
 alternatives, switch hysteresis, arrival-ordered decision-point replanning — plus the typical-scenario
