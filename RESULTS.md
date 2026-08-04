@@ -238,11 +238,77 @@ non-monotonic in the blend/noise parameters (0.6/0.10 measured best;
 | unreachable-trip events | 0 |
 
 
+## A1 answered on REAL road networks (not the synthetic city)
+
+Every performance number above was measured on a *synthetic* city. The single
+biggest architectural risk was A1 — **do real road networks have the small
+separators the CCH depends on?** That is now measured, using real road-network
+topology pulled from the DIMACS/PACE benchmark corpus
+([ben-strasser/road-graphs-pace16](https://github.com/ben-strasser/road-graphs-pace16)),
+replayed through the same harness via `harness import-dimacs`.
+
+This is a valid A1 test despite the files carrying no travel times, because **the
+CCH skeleton is metric-independent by construction** (plan §4 Layer 0: "computed
+once and remains valid for every metric"). Nested dissection, the shortcut set,
+the elimination tree and its height all come from topology alone.
+
+| measure | synthetic 131k | **Paris 202k** (real topo + real coords) | **New York 264k** (real topo, no coords) |
+|---|---|---|---|
+| chordal arcs | 9.2× | **8.0×** | 16.5× |
+| elimination tree height | 264 | **1,019** | 1,732 |
+| query median | 49–88 µs | **849 µs** | 4,169 µs |
+| query p99 | 108–154 µs | **1,415 µs** | 6,291 µs |
+| speedup vs Dijkstra | 110–124× | **27×** | — |
+| correctness vs Dijkstra | exact | **200/200 exact** | 200/200 exact |
+
+### Verdict: mixed, and specific
+
+**What holds.** The structural premise is sound: real road networks produce
+*less* shortcut blow-up than my synthetic city (8.0× vs 9.2×), so the
+all-shortcuts CCH superset is not a problem at real topology. And the engine is
+exactly correct on real maps — 200/200 against reference Dijkstra on both
+cities, which is the first time any of this code has touched non-synthetic data.
+
+**What does not.** The elimination tree is **~4× taller than the synthetic
+benchmark suggested** (1,019 vs 264), and since height drives query cost, the
+real-map speedup is **27×, not the 110–124× reported above**. The §6 target of
+p99 < 20 µs is far off on real topology.
+
+**The synthetic city flattered the result, and I can say exactly how.** I built
+it with district walls — local streets do not cross superblock boundaries every
+32 rows — to imitate real hierarchy. That produces *artificially clean*
+separators. Real road networks are messier, and the recursive geometric bisection
+in `NestedDissection` does not find comparably good cuts on them.
+
+**The bottleneck is the partitioner, not the architecture.** `NestedDissection`
+uses simple recursive coordinate bisection with a min-crossing window heuristic.
+The CCH literature uses substantially stronger separator algorithms — Inertial
+Flow, FlowCutter, KaHIP — precisely because separator quality is the whole game.
+This is a known, bounded, well-studied replacement, and it is the highest-value
+next piece of engineering in the repo.
+
+**Coordinates are load-bearing, and the fallback is a liability.** New York
+carries no coordinates, so it exercised the BFS level-set fallback: height 1,732,
+arcs 16.5×, queries 4,169 µs — roughly 5× worse queries and 2× worse arc blow-up
+than the same class of network *with* geometry. In-game this path should never be
+taken (CS2 supplies `Game.Net.Node.m_Position`), but the gap says the fallback
+should not be relied on anywhere.
+
+**What is unaffected.** Separator quality is orthogonal to most of this repo:
+the §4.9 route cache, portfolios and certificates, decision-point replanning, the
+anti-herding results, adaptive departures and the telemetry layer all sit above
+the query engine and are unchanged by tree height. A1 revises the *query latency*
+headline; it does not touch the equilibrium or caching results.
+
+**A2 remains open** — demand locality needs recorded CS2 trips, which needs the
+game. `harness import` already reports it whenever a demand trace is present.
+
 ## §6 acceptance-target scorecard
 
 | §6 target | measured (harness) | verdict |
 |---|---|---|
-| point-to-point query p99 < 20 µs at 10⁵ nodes | 315 µs p99, 110-124× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; absolute target needs Burst + real-city separators (a full-grid synthetic city is the worst case) |
+| point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **1,415 µs on real Paris (202k), 27× vs Dijkstra** — see the A1 section: the shortcut superset holds (8.0×) but the elimination tree is ~4× taller than the synthetic city suggested | **miss**; the fix is a stronger separator algorithm (Inertial Flow / FlowCutter), not an architectural change |
+| point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 315 µs p99, 110-124× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; absolute target needs Burst + real-city separators (a full-grid synthetic city is the worst case) |
 | full customization < 10 ms | 1.06 s (16 metrics, single-thread C#) | miss on absolute; the sweep is SIMD-lane-parallel and level-parallelizable — Burst-class headroom is large but this target is at risk and should be re-measured in-game |
 | typical partial customization < 1 ms | 9.4 ms median for a clustered congestion pocket (3,630 of 2.2M arcs — 0.16%); scattered random edges 132 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 4.0× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |

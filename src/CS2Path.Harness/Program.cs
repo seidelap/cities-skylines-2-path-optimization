@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -63,6 +64,40 @@ namespace CS2Path.Harness
                                                   (int)GetOpt(opts, "queries", 20_000));
                     File.WriteAllText("results-import.md", md);
                     Console.WriteLine("\nwrote results-import.md");
+                    return 0;
+                }
+                case "import-dimacs":
+                {
+                    if (!opts.TryGetValue("file", out var gr))
+                    { Console.WriteLine("usage: harness import-dimacs --file <graph.gr> [--out city.cs2city]"); return 2; }
+                    string dst = opts.TryGetValue("out", out var od) ? od
+                        : Path.ChangeExtension(Path.GetFileName(gr), ".cs2city");
+                    Console.WriteLine($"import-dimacs: parsing {gr} ...");
+                    CityExport city2;
+                    if (opts.TryGetValue("co", out var co) && opts.TryGetValue("bbox", out var bb))
+                    {
+                        var p = bb.Split(',');
+                        if (p.Length != 4) { Console.WriteLine("--bbox lonMin,latMin,lonMax,latMax"); return 2; }
+                        double lo1 = double.Parse(p[0], CultureInfo.InvariantCulture);
+                        double la1 = double.Parse(p[1], CultureInfo.InvariantCulture);
+                        double lo2 = double.Parse(p[2], CultureInfo.InvariantCulture);
+                        double la2 = double.Parse(p[3], CultureInfo.InvariantCulture);
+                        Console.WriteLine($"  bbox lon [{lo1},{lo2}] lat [{la1},{la2}] with real coordinates from {co}");
+                        city2 = DimacsImport.LoadWithCoords(gr, co, lo1, la1, lo2, la2, seed);
+                    }
+                    else city2 = DimacsImport.Load(gr, seed);
+                    city2.Validate();
+                    using (var fs = File.Create(dst)) city2.Write(fs);
+                    bool hasCoords = opts.ContainsKey("co") && opts.ContainsKey("bbox");
+                    Console.WriteLine($"wrote {dst}: {city2.NodeCount:N0} nodes, {city2.EdgeCount:N0} directed edges " +
+                                      $"({new FileInfo(dst).Length / 1e6:0.0} MB)");
+                    Console.WriteLine("NOTE: topology is real; edge weights are synthesised (structure, not cost, is");
+                    Console.WriteLine("      what A1 measures — the CCH skeleton is metric-independent).");
+                    Console.WriteLine(hasCoords
+                        ? "      Real coordinates present: geometric nested dissection is used."
+                        : "      No coordinates: nested dissection falls back to BFS bisection, which is the");
+                    if (!hasCoords)
+                        Console.WriteLine("      weaker path — treat the result as a pessimistic bound.");
                     return 0;
                 }
                 case "export-synthetic":
