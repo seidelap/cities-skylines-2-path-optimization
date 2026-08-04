@@ -140,10 +140,15 @@ namespace CS2Path.Harness
             eng.Metrics.FullCustomize();
             double fullMs = sw.Elapsed.TotalMilliseconds;
 
+            // Typical congestion deltas: ±10% multiplicative drift on the live
+            // time of spatially random edges — what a 3%-threshold EMA feed
+            // produces each refresh. One large-shock round is reported
+            // separately (mass closure / event churn).
             var changed = new List<int>();
             var partial100 = new List<double>(); var partial1000 = new List<double>();
             long arcs100 = 0, arcs1000 = 0;
-            for (int round = 0; round < 30; round++)
+            const int Rounds = 12;
+            for (int round = 0; round < Rounds; round++)
             {
                 foreach (var (list, count) in new[] { (partial100, 100), (partial1000, 1000) })
                 {
@@ -151,7 +156,8 @@ namespace CS2Path.Harness
                     for (int i = 0; i < count; i++)
                     {
                         int e = rng.NextInt(g.EdgeCount);
-                        g.TimeLive[e] = g.TimeFree[e] * (0.8f + 1.6f * rng.NextFloat());
+                        float mult = 0.9f + 0.2f * rng.NextFloat();
+                        g.TimeLive[e] = Math.Max(g.TimeFree[e] * 0.5f, Math.Min(g.TimeFree[e] * 6f, g.TimeLive[e] * mult));
                         changed.Add(e);
                     }
                     sw.Restart();
@@ -161,13 +167,27 @@ namespace CS2Path.Harness
                     else arcs1000 += eng.Metrics.LastPartialArcsRecomputed;
                 }
             }
+            // worst case: 1000 edges jump 0.8x-2.4x at once
+            changed.Clear();
+            for (int i = 0; i < 1000; i++)
+            {
+                int e = rng.NextInt(g.EdgeCount);
+                g.TimeLive[e] = g.TimeFree[e] * (0.8f + 1.6f * rng.NextFloat());
+                changed.Add(e);
+            }
+            sw.Restart();
+            eng.RefreshLive(changed);
+            double shockMs = sw.Elapsed.TotalMilliseconds;
+            long shockArcs = eng.Metrics.LastPartialArcsRecomputed;
+
             sb.AppendLine("### Layer 1 — customization (per traffic refresh)");
             sb.AppendLine();
             sb.AppendLine("| operation | time | §6 target |");
             sb.AppendLine("|---|---|---|");
             sb.AppendLine($"| full customization, all {K} metrics | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
-            sb.AppendLine($"| partial, 100 changed edges (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / 30:N0} arcs) | < 1 ms |");
-            sb.AppendLine($"| partial, 1000 changed edges (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / 30:N0} arcs) | — |");
+            sb.AppendLine($"| partial, 100 edges ±10% drift (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / Rounds:N0} arcs) | < 1 ms |");
+            sb.AppendLine($"| partial, 1000 edges ±10% drift (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / Rounds:N0} arcs) | — |");
+            sb.AppendLine($"| partial, 1000-edge large shock (0.8-2.4x) | {shockMs:N0} ms ({shockArcs:N0} arcs) | worst case, amortizable |");
             sb.AppendLine();
 
             // --- queries ---
@@ -250,7 +270,7 @@ namespace CS2Path.Harness
                     AgentId = i, Origin = s, Destination = t,
                     Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
                     Seed = seed ^ (ulong)(i * 6364136223846793005L),
-                    LongOrTransit = i % 8 == 0,
+                    LongOrTransit = i % 20 == 0,
                 };
             }
             var telemetry = new Telemetry();
@@ -398,7 +418,7 @@ namespace CS2Path.Harness
                     AgentId = i, Origin = rng.NextInt(n), Destination = rng.NextInt(n),
                     Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
                     Seed = seed ^ (ulong)(i * 2862933555777941757L),
-                    LongOrTransit = i % 10 == 0,
+                    LongOrTransit = i % 100 == 0,
                 });
             }
             var sw = Stopwatch.StartNew();

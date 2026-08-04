@@ -172,24 +172,25 @@ namespace CS2Path.Harness
         [ThreadStatic] private static float[]? _dist;
         [ThreadStatic] private static int[]? _pred;
         [ThreadStatic] private static int[]? _stampArr;
+        [ThreadStatic] private static int[]? _doneArr;
         [ThreadStatic] private static int _stamp;
 
         public static float Dijkstra(Graph g, int s, int t, Func<int, float> w, List<int>? pathOut = null)
         {
             int n = g.NodeCount;
-            if (_dist == null || _dist.Length < n) { _dist = new float[n]; _pred = new int[n]; _stampArr = new int[n]; _stamp = 0; }
-            var dist = _dist; var pred = _pred!; var stampArr = _stampArr!;
+            if (_dist == null || _dist.Length < n) { _dist = new float[n]; _pred = new int[n]; _stampArr = new int[n]; _doneArr = new int[n]; _stamp = 0; }
+            var dist = _dist; var pred = _pred!; var stampArr = _stampArr!; var done = _doneArr!;
             int stamp = ++_stamp;
             var heap = new SimpleHeap(1024);
             dist[s] = 0; stampArr[s] = stamp; pred[s] = -1;
             heap.Push(0, s);
-            var done = new HashSet<int>();
+            bool reached = false;
             while (heap.Count > 0)
             {
                 var (dv, v) = heap.Pop();
-                if (done.Contains(v)) continue;
-                done.Add(v);
-                if (v == t) break;
+                if (done[v] == stamp) continue;
+                done[v] = stamp;
+                if (v == t) { reached = true; break; }
                 for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++)
                 {
                     float we = w(e);
@@ -203,7 +204,7 @@ namespace CS2Path.Harness
                     }
                 }
             }
-            if (stampArr[t] != stamp || !done.Contains(t)) return float.PositiveInfinity;
+            if (!reached) return float.PositiveInfinity;
             if (pathOut != null)
             {
                 pathOut.Clear();
