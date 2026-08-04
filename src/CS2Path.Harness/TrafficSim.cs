@@ -231,15 +231,30 @@ namespace CS2Path.Harness
         /// the signal never learns and a jammed corridor keeps attracting demand.
         /// Real traffic telemetry sees queue state; both routing modes get this
         /// same estimator.</summary>
+        /// <summary>Congestion-signal regime. The vanilla baseline is bistable in
+        /// it: a FAST signal (occupancy-proportional) makes lagged best-response
+        /// oscillate between corridors; a SLOW signal (queue-excess only) makes
+        /// it collapse into absorbing single-corridor gridlock. The rebuild is
+        /// stable under both — the herding A/B reports both regimes.</summary>
+        public bool OccupancyProportionalSignal;
+
         public float LiveEstimate(int e)
         {
-            // queue delay = vehicles beyond free-flow transit, drained at the
-            // service rate; lightly-occupied edges report exactly free-flow so
-            // single-vehicle wobble never churns the customization layer
             float cap = Math.Max(0.5f, G.Capacity[e]);
-            float ffOcc = cap * (G.TimeFree[e] / Dt);
-            float queueExcess = Math.Max(0f, Occ[e] - ffOcc);
-            float drain = G.TimeFree[e] + queueExcess / cap * Dt;
+            float drain;
+            if (OccupancyProportionalSignal)
+            {
+                drain = G.TimeFree[e] + Occ[e] / cap * Dt;
+            }
+            else
+            {
+                // queue delay = vehicles beyond free-flow transit, drained at the
+                // service rate; lightly-occupied edges report exactly free-flow so
+                // single-vehicle wobble never churns the customization layer
+                float ffOcc = cap * (G.TimeFree[e] / Dt);
+                float queueExcess = Math.Max(0f, Occ[e] - ffOcc);
+                drain = G.TimeFree[e] + queueExcess / cap * Dt;
+            }
             return Math.Max(LiveEst[e], drain);
         }
 

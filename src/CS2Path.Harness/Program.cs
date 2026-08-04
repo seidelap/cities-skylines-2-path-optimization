@@ -446,6 +446,9 @@ namespace CS2Path.Harness
             sim.Planner!.Cfg.PenaltyIters = 1;
             sim.Planner.Cfg.RepairGapThreshold = 0.05f;
             sim.Planner.Cfg.MaxAlternatives = 4;
+            // coarser live-report deadband: the update engine's own degradation
+            // threshold is 10%, so sub-8% wobble only churns customization
+            sim.LiveChangeThreshold = 0.08f;
             var rng = new SplitMix64(seed + 7);
             int n = city.G.NodeCount;
             int departWindow = (int)(ticks * 0.6);
