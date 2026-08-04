@@ -600,7 +600,7 @@ namespace CS2Path.Harness
             Check(conf > 0f && conf <= 1f, $"prediction confidence out of range ({conf})");
             Check(probe.RatioCount > 0 && probe.RatioEma > 0.5f && probe.RatioEma < 2f, $"ratio EMA off ({probe.RatioEma:0.00})");
 
-            // gap #3: remap after re-dissection preserves route knowledge
+            // gap #3a: identity remap (stable node ids) preserves route knowledge
             var eng2 = RoutingEngine.Build(g, anchors);
             var remapped = cache.RemapAfterRebuild(eng2.CellPaths, g.NodeCount);
             Check(remapped.EntryCount == cache.EntryCount,
@@ -612,6 +612,34 @@ namespace CS2Path.Harness
                 if (created || (e2.Arrivals == 0 && e2.Vias.Count == 0)) lost++;
             }
             Check(lost == 0, $"remapped cache lost knowledge for {lost} OD pairs");
+
+            // gap #3b: RENUMBERING rebuild (the real road-project case): with the
+            // old->new mapping, knowledge must be found at the PHYSICAL ODs under
+            // their new ids, with vias translated — never range-checked stale ids
+            var perm = new int[g.NodeCount];
+            for (int v = 0; v < g.NodeCount; v++) perm[v] = v;
+            var prng = new SplitMix64(seed + 7);
+            for (int v = g.NodeCount - 1; v > 0; v--)
+            {
+                int j = prng.NextInt(v + 1);
+                (perm[v], perm[j]) = (perm[j], perm[v]);
+            }
+            var permCells = new NestedDissection.CellPath[g.NodeCount];
+            for (int v = 0; v < g.NodeCount; v++) permCells[perm[v]] = eng.CellPaths[v];
+            var remap2 = cache.RemapAfterRebuild(permCells, g.NodeCount, perm);
+            int lost2 = 0, staleVias = 0;
+            foreach (var (s, t) in ods)
+            {
+                var e2 = remap2.GetOrCreate(perm[s], perm[t], out bool created);
+                if (created || (e2.Arrivals == 0 && e2.Vias.Count == 0)) { lost2++; continue; }
+            }
+            var entryOld = cache.GetOrCreate(ods[0].s, ods[0].t, out _);
+            var entryNew = remap2.GetOrCreate(perm[ods[0].s], perm[ods[0].t], out _);
+            var expectVias = new HashSet<int>();
+            foreach (var v in entryOld.Vias) expectVias.Add(perm[v.Via]);
+            foreach (var v in entryNew.Vias) if (!expectVias.Contains(v.Via)) staleVias++;
+            Check(lost2 == 0, $"renumbering remap lost knowledge for {lost2} physical OD pairs");
+            Check(staleVias == 0, $"renumbering remap kept {staleVias} untranslated via ids");
 
             // gap #2: warmup governor bounds direct generations, thin service still plans
             var planner2 = new TripPlanner(eng.Metrics, eng.Query);

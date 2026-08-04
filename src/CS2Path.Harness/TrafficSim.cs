@@ -155,12 +155,16 @@ namespace CS2Path.Harness
                     trip.Plan = plan;
                     if (!plan.HasPlan) { trip.Finished = true; Trips.Add(trip); continue; }
                     trip.CurrentNode = req.Origin;
-                    trip.LastRemainingCost = plan.Alts[plan.ChosenIdx].AnchorCost;
+                    // seed the bound stamp in the same BLENDED units Layer 4 compares in
+                    trip.LastRemainingCost = Planner.RemainingPathCostBlended(
+                        plan.ChosenEdgePath, 0, plan.NearestProfile, plan.StableBlend);
+                    trip.DepartureEntry = plan.Entry;
                     float pred = 0f;
                     foreach (var e in plan.ChosenEdgePath) pred += G.TimeLive[e];
                     trip.PredictedSeconds = pred;
                     ArmTriggers(trip);
                     Trips.Add(trip);
+                    _activeIdx.Add(Trips.Count - 1);
                     Upd!.RegisterRoute(Trips.Count - 1, trip);
                 }
                 else
@@ -181,19 +185,27 @@ namespace CS2Path.Harness
                     trip.CurrentNode = req.Origin;
                     if (!plan.HasPlan) trip.Finished = true;
                     Trips.Add(trip);
+                    if (!trip.Finished) _activeIdx.Add(Trips.Count - 1);
                 }
             }
         }
 
         // ------------------------------------------------------------------
+        // live agent index: Movement is O(active), not O(all trips ever) —
+        // multi-day runs would otherwise scan every finished trip each tick
+        private readonly List<int> _activeIdx = new List<int>();
+
         private void Movement()
         {
             Array.Clear(ExitsThisTick, 0, ExitsThisTick.Length);
             var g = G;
-            for (int a = 0; a < Trips.Count; a++)
+            int w0 = 0;
+            for (int ii = 0; ii < _activeIdx.Count; ii++)
             {
+                int a = _activeIdx[ii];
                 var t = Trips[a];
                 if (t.Finished || !t.Plan.HasPlan) continue;
+                _activeIdx[w0++] = a;
                 var path = t.Plan.ChosenEdgePath;
 
                 if (t.CurEdge < 0)
@@ -231,6 +243,7 @@ namespace CS2Path.Harness
                 MeasureExit(a, t, e);
                 Enter(a, t, nxt);
             }
+            _activeIdx.RemoveRange(w0, _activeIdx.Count - w0);
         }
 
         /// <summary>§4 L4 v2: decision-point triggers spaced along the trunk
@@ -337,10 +350,11 @@ namespace CS2Path.Harness
             t.FinishTick = Tick;
             FinishedTrips++;
             TotalTravelTicks += Tick - t.DepartTick;
-            // realized travel-time telemetry on the cluster entry (register #2)
+            // realized travel-time telemetry, attributed to the entry the trip
+            // DEPARTED under (regeneration re-keys Plan.Entry to a partial leg)
             var cache = Planner?.Cache;
-            if (cache != null && t.Plan.Entry != null)
-                cache.RecordRealized(t.Plan.Entry, TodBucketOf(t.DepartTick),
+            if (cache != null && t.DepartureEntry != null)
+                cache.RecordRealized(t.DepartureEntry, TodBucketOf(t.DepartTick),
                     (Tick - t.DepartTick) * Dt, t.PredictedSeconds);
         }
 
@@ -470,10 +484,11 @@ namespace CS2Path.Harness
             var fresh = Planner!.PlanFixed(in req);
             if (!fresh.HasPlan) return false;
             fresh.Seed = old.Seed;
-            t.Plan = fresh;
+            t.Plan = fresh;                 // DepartureEntry intentionally kept: telemetry stays on the original OD
             t.PathCursor = 0;
             t.RouteVersion++;
-            t.LastRemainingCost = fresh.Alts[fresh.ChosenIdx].AnchorCost;
+            t.LastRemainingCost = Planner.RemainingPathCostBlended(
+                fresh.ChosenEdgePath, 0, fresh.NearestProfile, fresh.StableBlend);
             ArmTriggers(t);
             Upd!.RegisterRoute(agent, t);
             return true;

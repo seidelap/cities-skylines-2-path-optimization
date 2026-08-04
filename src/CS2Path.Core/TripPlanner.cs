@@ -243,10 +243,14 @@ namespace CS2Path.Core
             if (!needDirect) { plan.ServedFromCache = true; Stats.ServedFromCache++; }
             else Stats.DirectGenerations++;
 
-            // dynamic stable blend (register #3): damping floor + horizon x confidence
+            // dynamic stable blend (register #3): damping floor + horizon x confidence.
+            // Horizon measured on the PURE-TIME axis lane (profile 0 = AxisTime,
+            // seconds) — dNear mixes preference units and would skew per alpha.
             {
                 float conf = entry?.PredictionConfidence(CurrentTodBucket) ?? 0f;
-                float horizon = Math.Min(1f, dNear / Math.Max(1f, Cfg.HorizonFullSec));
+                float timeDist = plan.LiveAnchorDists[0];
+                if (!float.IsFinite(timeDist)) timeDist = dNear;
+                float horizon = Math.Min(1f, timeDist / Math.Max(1f, Cfg.HorizonFullSec));
                 plan.StableBlend = Cfg.TypicalBlend
                     + (Cfg.StableBlendMax - Cfg.TypicalBlend) * horizon * conf;
             }
@@ -507,10 +511,14 @@ namespace CS2Path.Core
                 return;
             }
 
-            if (plan.CertGap > Cfg.RepairGapThreshold && _lambda.Count <= PotentialAStar.MaxLanes)
+            if (plan.CertGap > Cfg.RepairGapThreshold && _lambda.Count <= PotentialAStar.MaxLanes
+                && plan.ChosenIdx < 0)
             {
                 // Legacy synchronous repair (feature-flag fallback when no cache
                 // is attached): exact A* under true alpha, LP lambda potential.
+                // Guarded to the not-yet-chosen (cold) path: the warm path sets
+                // ChosenIdx before Certify, and inserting at Alts[0] there would
+                // shift the chosen index and desync the geometry scratch lists.
                 var lamArr = new (int metric, float lambda)[_lambda.Count];
                 for (int i = 0; i < _lambda.Count; i++)
                     lamArr[i] = (LiveMetric(_lambda[i].profile), _lambda[i].lambda);
@@ -626,6 +634,7 @@ namespace CS2Path.Core
         }
 
         private readonly List<float> _cheapFf = new List<float>(8);
+        private readonly List<float> _cheapStable = new List<float>(8);
         private readonly List<int> _chosenBuf = new List<int>(512);
 
         /// <summary>
@@ -641,8 +650,14 @@ namespace CS2Path.Core
         private bool BuildHeldCheap(TripPlan plan, int s, int t, int nearK, float dNear, List<(int via, bool backup)> vias)
         {
             int ffK = _anchors.ScenarioBlockStart(Scenario.FreeFlow) + plan.NearestProfile;
+            // Choice blends against the SAME stable lane Layer 4 uses (typical
+            // when present, else free-flow); free-flow always serves the
+            // cross-scenario retention test.
+            int stableK = _hasTypical
+                ? _anchors.ScenarioBlockStart(Scenario.Typical) + plan.NearestProfile : ffK;
             plan.Alts.Clear();
             _cheapFf.Clear();
+            _cheapStable.Clear();
             float bestLive = dNear, bestFf = float.PositiveInfinity;
             foreach (var (via, backup) in vias)
             {
@@ -658,6 +673,12 @@ namespace CS2Path.Core
                 bool liveOk = live <= bestLive * Cfg.StretchMax;
                 bool ffOk = ff <= bestFf * Cfg.StretchMax;
                 if (!backup && !liveOk && !ffOk) continue;
+                float stable = ff;
+                if (stableK != ffK)
+                {
+                    float s1 = _q.Distance(_ctx, s, via, stableK);
+                    stable = float.IsPositiveInfinity(s1) ? s1 : s1 + _q.Distance(_ctx, via, t, stableK);
+                }
                 plan.Alts.Add(new Alternative
                 {
                     ViaNode = via, Destination = t,
@@ -665,6 +686,7 @@ namespace CS2Path.Core
                     IsDisjointBackup = backup,
                 });
                 _cheapFf.Add(ff);
+                _cheapStable.Add(stable);
             }
             if (plan.Alts.Count == 0) return false;
 
@@ -683,14 +705,15 @@ namespace CS2Path.Core
                 {
                     plan.Alts.RemoveAt(i);
                     _cheapFf.RemoveAt(i);
+                    _cheapStable.RemoveAt(i);
                 }
             }
 
             // choice on stable-blended anchor scores (per-trip dynamic weight)
             float w = plan.StableBlend > 0 ? plan.StableBlend : Cfg.TypicalBlend;
             int chosen = SelectByLogit(plan, i =>
-                float.IsPositiveInfinity(_cheapFf[i]) ? plan.Alts[i].AnchorCost
-                    : (1 - w) * plan.Alts[i].AnchorCost + w * _cheapFf[i]);
+                float.IsPositiveInfinity(_cheapStable[i]) ? plan.Alts[i].AnchorCost
+                    : (1 - w) * plan.Alts[i].AnchorCost + w * _cheapStable[i]);
             if (chosen < 0) return false;
 
             // expand geometry for the DRIVEN route only; exact alpha on it
@@ -789,6 +812,19 @@ namespace CS2Path.Core
             return d;
         }
 
+        /// <summary>Stable-blended probe: same units as the blended incumbent it
+        /// is compared against in the Layer-4 tier gate.</summary>
+        public float ProbeBlended(TripPlan plan, int fromNode, int dest, int profile, float w)
+        {
+            float live = ProbeAndHarvest(plan, fromNode, dest, profile);
+            if (w <= 0f || float.IsPositiveInfinity(live)) return live;
+            int stableK = (_hasTypical ? _anchors.ScenarioBlockStart(Scenario.Typical)
+                                       : _anchors.ScenarioBlockStart(Scenario.FreeFlow)) + profile;
+            float st = _q.Distance(_ctx, fromNode, dest, stableK);
+            if (float.IsPositiveInfinity(st)) return live;
+            return (1 - w) * live + w * st;
+        }
+
         /// <summary>§4.8 v2: "individual holdings refresh from the shared tree at
         /// the next decision point" — adopt the best entry via not already held,
         /// if it prices within the envelope of the incumbent. Returns true if a
@@ -858,13 +894,23 @@ namespace CS2Path.Core
             foreach (var e in entries)
             {
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                if (e.GapSampleS < 0) { e.Urgent = false; continue; }
-                int s = e.GapSampleS, t = e.GapSampleT;
-                var alpha = e.GapSampleAlpha;
+                // locked snapshot: LogGap publishes these fields under the cache lock
+                bool hasSample = Cache.TrySnapshotGapSample(e, out int s, out int t, out var alpha, out int gapCount);
+                if (!hasSample)
+                {
+                    // sample-less gap demand (e.g. carried imperfectly across a
+                    // rebuild) is drained — it must never occupy budget forever —
+                    // and quarantine draws fall back to the representative OD.
+                    if (gapCount > 0) Cache.DrainGap(e);
+                    if (!e.Urgent || e.RepS < 0) { e.Urgent = false; continue; }
+                    s = e.RepS; t = e.RepT;
+                    alpha = new Preference(1f, 0.05f, 0.05f);
+                    gapCount = 0;
+                }
                 int nearProf = _anchors.NearestProfile(alpha);
                 int nearK = LiveMetric(nearProf);
 
-                if (e.GapCount > 0)
+                if (gapCount > 0)
                 {
                     // async repair: exact A* under the sampled alpha, LP potential
                     int P = _anchors.ProfileCount;
@@ -891,7 +937,7 @@ namespace CS2Path.Core
                     }
                     Cache.DrainGap(e);
                 }
-                else if (e.Urgent)
+                else
                 {
                     // quarantine coverage: free-flow-scenario draw (the route that
                     // is excellent once traffic clears must be in the tree) ...

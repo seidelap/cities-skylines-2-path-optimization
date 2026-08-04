@@ -702,13 +702,22 @@ namespace CS2Path.Harness
                     int dayStart = day * dayTicks;
                     for (int i = 0; i < commuters; i++)
                     {
-                        int lead;
-                        var entry = adaptive ? sim.Planner.Cache.GetOrCreate(home[i], work[i], out _) : null;
-                        int bucket = sim.TodBucketOf(dayStart + target[i]);
-                        if (adaptive && entry != null && entry.RealizedCount[bucket] >= 3)
-                            lead = (int)((entry.RealizedMean[bucket] + kRisk[i] * entry.RealizedDev[bucket]) / sim.Dt);
-                        else
-                            lead = (int)(est0[i] * 1.25f);
+                        // read-only lookup (no entry creation / stat pollution);
+                        // telemetry is keyed by DEPART bucket, so read via a
+                        // one-step fixed point on the anticipated depart time
+                        int lead = (int)(est0[i] * 1.25f);
+                        var entry = adaptive ? sim.Planner.Cache!.TryGet(home[i], work[i]) : null;
+                        if (adaptive && entry != null)
+                        {
+                            int bucket = sim.TodBucketOf(Math.Max(dayStart + 1, dayStart + target[i] - lead));
+                            if (entry.RealizedCount[bucket] >= 3)
+                            {
+                                lead = (int)((entry.RealizedMean[bucket] + kRisk[i] * entry.RealizedDev[bucket]) / sim.Dt);
+                                int bucket2 = sim.TodBucketOf(Math.Max(dayStart + 1, dayStart + target[i] - lead));
+                                if (bucket2 != bucket && entry.RealizedCount[bucket2] >= 3)
+                                    lead = (int)((entry.RealizedMean[bucket2] + kRisk[i] * entry.RealizedDev[bucket2]) / sim.Dt);
+                            }
+                        }
                         int depart = Math.Max(dayStart + 1, dayStart + target[i] - lead - jit[i]);
                         sim.AddTrip(depart, new TripRequest
                         {
@@ -717,14 +726,19 @@ namespace CS2Path.Harness
                             Seed = seed ^ (ulong)((agentBase + i) * 6364136223846793005L),
                         });
                     }
+                    int tripsBefore = sim.Trips.Count;
                     sim.Run(dayTicks);
 
-                    // per-day stats over this day's agents
+                    // per-day stats over this day's agents — trips enter
+                    // sim.Trips in DEPART order, so recover the commuter index
+                    // from the trip's AgentId, never from list position
                     double tSum = 0, lSum = 0, lAbs = 0, dSum = 0, dSq = 0, aSum = 0, aSq = 0;
                     int n = 0, late = 0, arrived = 0;
-                    for (int i = 0; i < commuters; i++)
+                    for (int k = tripsBefore; k < sim.Trips.Count; k++)
                     {
-                        var t = sim.Trips[agentBase + i];
+                        var t = sim.Trips[k];
+                        int i = t.Plan.AgentId - agentBase;
+                        if (i < 0 || i >= commuters) continue;
                         if (!t.Finished || t.FinishTick < 0) continue;
                         arrived++;
                         double travel = t.FinishTick - t.DepartTick;

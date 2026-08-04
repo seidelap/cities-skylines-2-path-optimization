@@ -12,6 +12,10 @@ namespace CS2Path.Core
         public int RouteVersion;        // bumps on every route switch (stale-index check)
         public float LastRemainingCost; // anchor units at last (re)price
         public bool Finished;
+        /// <summary>Entry the trip DEPARTED under — realized telemetry must be
+        /// attributed here (regeneration mid-trip re-keys Plan.Entry to a
+        /// partial-leg pair; recording full-trip time there poisons its stats).</summary>
+        public ClusterEntry? DepartureEntry;
         // decision-point trigger cursor (§4 L4 v2): next path index at which the
         // agent re-evaluates its held branches; spacing set at registration.
         // LastCorridorCode fires triggers at corridor-cell boundaries — the
@@ -262,7 +266,11 @@ namespace CS2Path.Core
 
             // §4.8 v2: refresh holdings from the shared entry — a via donated by
             // exploration (or another trip) reaches in-flight agents here.
-            _planner.TryAdoptFromEntry(plan, cur, profile, curCost);
+            // Adoption prices candidates LIVE, so gate against the live incumbent
+            // (comparing live candidates to a blended incumbent mixes units).
+            float liveCur = blend > 0
+                ? _planner.RemainingPathCost(plan.ChosenEdgePath, t.PathCursor, profile) : curCost;
+            _planner.TryAdoptFromEntry(plan, cur, profile, liveCur);
 
             // Tier 1: re-price the rest of the portfolio — O(k) via re-pricing,
             // BLENDED with the stable scenario so switching decisions don't
@@ -295,7 +303,8 @@ namespace CS2Path.Core
             // gone infinite — e.g. a closure severed every alternative.
             if (wholePortfolioDegraded || float.IsPositiveInfinity(incumbent))
             {
-                float probe = _planner.ProbeAndHarvest(plan, cur, plan.Destination, profile);
+                // probe in the SAME blended units as the incumbent it must beat
+                float probe = _planner.ProbeBlended(plan, cur, plan.Destination, profile, blend);
                 Stats.Probes++;
                 // Tier 3: full regeneration only if the probe beats the whole
                 // portfolio by the hysteresis margin.

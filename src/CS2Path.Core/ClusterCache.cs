@@ -58,6 +58,7 @@ namespace CS2Path.Core
 
         public void RecordRealized(int bucket, float realizedSec, float predictedSec)
         {
+            if (!float.IsFinite(realizedSec) || realizedSec <= 0f) return; // bad sample: never poison the EMAs
             const float A = 0.15f;       // slow EMA: learning must lag the swings it damps
             bucket = Math.Max(0, Math.Min(TodBuckets - 1, bucket));
             if (RealizedCount[bucket] == 0)
@@ -124,7 +125,7 @@ namespace CS2Path.Core
 
         public void RefillDirectGenBudget()
         {
-            _directGenTokens = DirectGenBudget < 0 ? int.MaxValue : DirectGenBudget;
+            lock (_sync) _directGenTokens = DirectGenBudget < 0 ? int.MaxValue : DirectGenBudget;
         }
 
         /// <summary>Consume one direct-generation token; false = governor says
@@ -287,42 +288,96 @@ namespace CS2Path.Core
             }
         }
 
-        /// <summary>Gap #3: re-key every entry after a Layer-0 re-dissection —
-        /// background rebuilds renumber cells, and without matching, every major
-        /// road project would orphan the cache and reproduce the cold-start
-        /// storm. Entries re-key by their representative OD pair under the NEW
-        /// cell paths; vias that no longer exist are dropped; entries whose
-        /// endpoints vanished are evicted. Call with the rebuilt engine's
-        /// CellPaths and node count.</summary>
-        public ClusterCache RemapAfterRebuild(NestedDissection.CellPath[] newCells, int newNodeCount)
+        /// <summary>Gap #3: re-key every entry after a Layer-0 re-dissection.
+        /// Node ids are meaningful only within one graph build, so the graph
+        /// owner MUST supply the old→new node-id mapping (−1 = node vanished);
+        /// pass null ONLY when node ids are provably stable across the rebuild.
+        /// Without a mapping on a renumbering rebuild the only safe behavior is
+        /// dropping the cache — range checks would silently re-key entries to
+        /// wrong physical corridors that still claim coverage. Entries re-key by
+        /// their mapped representative OD; vias/ViaSeen translate; Good–Turing
+        /// singletons are recomputed from the surviving set; gap samples and
+        /// urgency carry only when their endpoints survive; LRU recency carries.</summary>
+        public ClusterCache RemapAfterRebuild(NestedDissection.CellPath[] newCells, int newNodeCount, int[]? oldToNew = null)
         {
             var fresh = new ClusterCache(newCells)
             {
                 MaxEntries = MaxEntries, EntryViaCap = EntryViaCap, DirectGenBudget = DirectGenBudget,
             };
+            int Map(int id)
+            {
+                if (id < 0) return -1;
+                if (oldToNew != null) return id < oldToNew.Length ? oldToNew[id] : -1;
+                return id < newNodeCount ? id : -1;
+            }
             lock (_sync)
             {
                 foreach (var e in _entries.Values)
                 {
-                    if (e.RepS < 0 || e.RepS >= newNodeCount || e.RepT < 0 || e.RepT >= newNodeCount) continue;
-                    var moved = fresh.GetOrCreate(e.RepS, e.RepT, out bool created);
-                    if (!created) continue; // key collision: keep the first
-                    // carry route knowledge + telemetry; drop out-of-range vias
-                    moved.Vias.Clear();
+                    int ns = Map(e.RepS), nt = Map(e.RepT);
+                    if (ns < 0 || ns >= newNodeCount || nt < 0 || nt >= newNodeCount) continue;
+                    var moved = fresh.GetOrCreate(ns, nt, out bool created);
+                    if (!created)
+                    {
+                        // key collision: keep the entry with more evidence
+                        if (moved.Arrivals >= e.Arrivals) continue;
+                        moved.Vias.Clear(); moved.ViaSeen.Clear();
+                    }
                     foreach (var v in e.Vias)
-                        if (v.Via >= 0 && v.Via < newNodeCount) moved.Vias.Add(v);
+                    {
+                        int nv = Map(v.Via);
+                        if (nv >= 0 && nv < newNodeCount)
+                            moved.Vias.Add(new ClusterEntry.ViaCandidate { Via = nv, MetricId = v.MetricId });
+                    }
+                    int singles = 0;
                     foreach (var kv in e.ViaSeen)
-                        if (kv.Key >= 0 && kv.Key < newNodeCount) moved.ViaSeen[kv.Key] = kv.Value;
-                    moved.Arrivals = e.Arrivals; moved.Singletons = e.Singletons;
-                    moved.GapSum = e.GapSum; moved.GapCount = e.GapCount;
+                    {
+                        int nv = Map(kv.Key);
+                        if (nv < 0 || nv >= newNodeCount) continue;
+                        moved.ViaSeen[nv] = kv.Value;
+                        if (kv.Value == 1) singles++;
+                    }
+                    moved.Arrivals = e.Arrivals;
+                    moved.Singletons = singles; // recomputed over the surviving set
+                    int gs = Map(e.GapSampleS), gt = Map(e.GapSampleT);
+                    if (gs >= 0 && gs < newNodeCount && gt >= 0 && gt < newNodeCount)
+                    {
+                        moved.GapSum = e.GapSum; moved.GapCount = e.GapCount;
+                        moved.GapSampleS = gs; moved.GapSampleT = gt;
+                        moved.GapSampleAlpha = e.GapSampleAlpha;
+                        moved.Urgent = e.Urgent;
+                    }
+                    // else: demand re-accumulates from live gaps — never carry
+                    // sample-less demand that would starve the exploration budget
                     Array.Copy(e.RealizedMean, moved.RealizedMean, ClusterEntry.TodBuckets);
                     Array.Copy(e.RealizedDev, moved.RealizedDev, ClusterEntry.TodBuckets);
                     Array.Copy(e.RealizedCount, moved.RealizedCount, ClusterEntry.TodBuckets);
                     moved.RatioEma = e.RatioEma; moved.RatioCount = e.RatioCount;
+                    moved.LastUsedStamp = e.LastUsedStamp;
                 }
+                fresh._stamp = Math.Max(fresh._stamp, _stamp);
                 fresh.Hits = Hits; fresh.Misses = Misses;
             }
             return fresh;
+        }
+
+        /// <summary>Read-only lookup (no insert, no LRU/stat side effects).</summary>
+        public ClusterEntry? TryGet(int s, int t)
+        {
+            int level = PairLevel(s, t);
+            var key = (CellCode(in _cells[s], level), CellCode(in _cells[t], level));
+            lock (_sync) return _entries.TryGetValue(key, out var e) ? e : null;
+        }
+
+        /// <summary>Locked snapshot of an entry's gap sample for the exploration
+        /// worker (LogGap publishes these fields under the same lock).</summary>
+        public bool TrySnapshotGapSample(ClusterEntry e, out int s, out int t, out Preference alpha, out int gapCount)
+        {
+            lock (_sync)
+            {
+                s = e.GapSampleS; t = e.GapSampleT; alpha = e.GapSampleAlpha; gapCount = e.GapCount;
+                return s >= 0 && t >= 0;
+            }
         }
 
         public long EstimatedBytes()
