@@ -255,18 +255,20 @@ namespace CS2Path.Core
             // Incumbent price: the true remaining cost of the path being driven.
             // (Re-pricing the chosen alternative as cur->via->dest would inflate
             // it once the agent has passed its via node.)
-            float curCost = _planner.RemainingPathCost(plan.ChosenEdgePath, t.PathCursor, profile);
+            float curCost = _planner.RemainingPathCostBlended(plan.ChosenEdgePath, t.PathCursor, profile);
 
             // §4.8 v2: refresh holdings from the shared entry — a via donated by
             // exploration (or another trip) reaches in-flight agents here.
             _planner.TryAdoptFromEntry(plan, cur, profile, curCost);
 
-            // Tier 1: re-price the rest of the portfolio — O(k) via re-pricing.
+            // Tier 1: re-price the rest of the portfolio — O(k) via re-pricing,
+            // BLENDED with the stable scenario so switching decisions don't
+            // best-respond to raw live swings (that is the herding mechanism).
             int bestIdx = -1; float bestCost = float.PositiveInfinity;
             for (int i = 0; i < plan.Alts.Count; i++)
             {
                 if (i == plan.ChosenIdx) continue;
-                float c = _planner.RepriceAlternative(cur, plan.Alts[i], profile);
+                float c = _planner.RepriceAlternativeBlended(cur, plan.Alts[i], profile);
                 Stats.Reprices++;
                 if (c < bestCost) { bestCost = c; bestIdx = i; }
             }

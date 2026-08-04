@@ -267,8 +267,20 @@ namespace CS2Path.Core
                 }
             }
 
-            // --- 4. Admissibility filter + exact true-alpha scoring ---
-            BuildScoredAlternatives(plan, s, t, nearK, dNear, vias);
+            // --- 4. Score + choose. Warm (cache-served) trips take the cheap
+            // path: re-pricing queries only, geometry expanded only for the
+            // driven route (§4.9). Cold trips get full exact-alpha scoring.
+            bool warmChosen = false;
+            if (plan.ServedFromCache)
+            {
+                warmChosen = BuildHeldCheap(plan, s, t, nearK, dNear, vias);
+                if (!warmChosen)
+                {
+                    plan.ServedFromCache = false;
+                    Stats.ServedFromCache--; Stats.DirectGenerations++;
+                }
+            }
+            if (!warmChosen) BuildScoredAlternatives(plan, s, t, nearK, dNear, vias);
             if (plan.Alts.Count == 0)
             {
                 // §4.7 v2 synchronous fallback: portfolio collapse (no feasible
@@ -303,9 +315,10 @@ namespace CS2Path.Core
                     if (!_tripHarvested.Contains(alt.ViaNode))
                         Cache.Harvest(entry, alt.ViaNode, (short)nearK);
 
-            // --- 5. Certificate, async exploration demand, nested-logit choice ---
+            // --- 5. Certificate, async exploration demand, nested-logit choice
+            // (warm trips already chose inside BuildHeldCheap) ---
             Certify(plan, s, t);
-            Choose(plan, s, t, nearK);
+            if (!warmChosen) Choose(plan, s, t, nearK);
 
             // §4.9 memory model: shared entries + private cursor. The retained
             // per-agent state is the held-branch view (Alts, small), the driven
@@ -513,16 +526,27 @@ namespace CS2Path.Core
         /// Flat logit otherwise: u_i = -cost_i + eta*Gumbel_i.</summary>
         private void Choose(TripPlan plan, int s, int t, int nearK)
         {
-            var rng = new SplitMix64(plan.Seed);
             bool blended = _choiceScores.Count == plan.Alts.Count;
-            float eta = Cfg.LogitScale * plan.BestAlphaCost;
+            int best = SelectByLogit(plan, i => blended ? _choiceScores[i] : plan.Alts[i].AlphaCost);
+            plan.ChosenIdx = best;
+            plan.ChosenAlphaCost = plan.Alts[best].AlphaCost;
+            plan.ChosenEdgePath.Clear();
+            plan.ChosenEdgePath.AddRange(_acceptedGeomsScratch[best]);
+        }
+
+        /// <summary>Nested (corridor-first, §4.9) or flat logit selection over
+        /// the current alternatives under the given score function.</summary>
+        private int SelectByLogit(TripPlan plan, Func<int, float> Score)
+        {
+            var rng = new SplitMix64(plan.Seed);
+            float minScore = float.PositiveInfinity;
+            for (int i = 0; i < plan.Alts.Count; i++) minScore = Math.Min(minScore, Score(i));
+            float eta = Cfg.LogitScale * minScore;
             int best = -1;
-            float Score(int i) => blended ? _choiceScores[i] : plan.Alts[i].AlphaCost;
 
             if (Cfg.NestedLogit && Cache != null && plan.Alts.Count >= 3 && eta > 0)
             {
                 int level = plan.Entry?.Level ?? 6;
-                // group by corridor identity of the via node
                 var nestOf = new ulong[plan.Alts.Count];
                 var nests = new List<ulong>(4);
                 for (int i = 0; i < plan.Alts.Count; i++)
@@ -559,14 +583,96 @@ namespace CS2Path.Core
                 float bestU = float.NegativeInfinity;
                 for (int i = 0; i < plan.Alts.Count; i++)
                 {
-                    float u = -Score(i) + eta * rng.NextGumbel();
+                    float u = -Score(i) + (eta > 0 ? eta * rng.NextGumbel() : 0f);
                     if (u > bestU) { bestU = u; best = i; }
                 }
             }
-            plan.ChosenIdx = best;
-            plan.ChosenAlphaCost = plan.Alts[best].AlphaCost;
+            return best;
+        }
+
+        private readonly List<float> _cheapFf = new List<float>(8);
+        private readonly List<int> _chosenBuf = new List<int>(512);
+
+        /// <summary>
+        /// §4.9 warm path: held branches are scored by RE-PRICING QUERIES ONLY
+        /// (live + free-flow anchor costs, cross-scenario retention), the choice
+        /// runs nested logit over stable-blended anchor scores, and full
+        /// lane-level geometry is expanded ONLY for the route actually driven.
+        /// The certificate then measures the driven route's exact alpha cost
+        /// against the LP lower bound — a gap becomes exploration demand as
+        /// usual. Returns false if no held branch is feasible (caller falls
+        /// back to direct generation / sync fallback).
+        /// </summary>
+        private bool BuildHeldCheap(TripPlan plan, int s, int t, int nearK, float dNear, List<(int via, bool backup)> vias)
+        {
+            int ffK = _anchors.ScenarioBlockStart(Scenario.FreeFlow) + plan.NearestProfile;
+            plan.Alts.Clear();
+            _cheapFf.Clear();
+            float bestLive = dNear, bestFf = float.PositiveInfinity;
+            foreach (var (via, backup) in vias)
+            {
+                if (plan.Alts.Count >= Cfg.MaxAlternatives) break;
+                float d1 = _q.Distance(_ctx, s, via, nearK);
+                if (float.IsPositiveInfinity(d1)) continue;
+                float live = d1 + _q.Distance(_ctx, via, t, nearK);
+                if (float.IsPositiveInfinity(live)) continue;
+                float f1 = _q.Distance(_ctx, s, via, ffK);
+                float ff = float.IsPositiveInfinity(f1) ? f1 : f1 + _q.Distance(_ctx, via, t, ffK);
+                if (live < bestLive) bestLive = live;
+                if (ff < bestFf) bestFf = ff;
+                bool liveOk = live <= bestLive * Cfg.StretchMax;
+                bool ffOk = ff <= bestFf * Cfg.StretchMax;
+                if (!backup && !liveOk && !ffOk) continue;
+                plan.Alts.Add(new Alternative
+                {
+                    ViaNode = via, Destination = t,
+                    AnchorCost = live, AlphaCost = live, // anchor proxy; exact alpha materializes for the driven route
+                    IsDisjointBackup = backup,
+                });
+                _cheapFf.Add(ff);
+            }
+            if (plan.Alts.Count == 0) return false;
+
+            // ε-envelope across scenarios on anchor costs
+            float minLive = float.PositiveInfinity, minFf = float.PositiveInfinity;
+            for (int i = 0; i < plan.Alts.Count; i++)
+            {
+                minLive = Math.Min(minLive, plan.Alts[i].AnchorCost);
+                minFf = Math.Min(minFf, _cheapFf[i]);
+            }
+            for (int i = plan.Alts.Count - 1; i >= 0; i--)
+            {
+                bool liveIn = plan.Alts[i].AnchorCost <= minLive * (1 + Cfg.EnvelopeEps);
+                bool ffIn = _cheapFf[i] <= minFf * (1 + Cfg.EnvelopeEps);
+                if (!plan.Alts[i].IsDisjointBackup && !liveIn && !ffIn && plan.Alts.Count > 1)
+                {
+                    plan.Alts.RemoveAt(i);
+                    _cheapFf.RemoveAt(i);
+                }
+            }
+
+            // choice on stable-blended anchor scores
+            float w = Cfg.TypicalBlend;
+            int chosen = SelectByLogit(plan, i =>
+                float.IsPositiveInfinity(_cheapFf[i]) ? plan.Alts[i].AnchorCost
+                    : (1 - w) * plan.Alts[i].AnchorCost + w * _cheapFf[i]);
+            if (chosen < 0) return false;
+
+            // expand geometry for the DRIVEN route only; exact alpha on it
+            ExpandAlternative(plan, chosen, s, _chosenBuf);
+            if (_chosenBuf.Count == 0 && s != t) return false;
+            var alpha = plan.Alpha;
+            float alphaCost = 0f;
+            foreach (var e in _chosenBuf) alphaCost += AnchorGrid.AlphaWeightLive(_g, e, in alpha);
+            plan.ChosenIdx = chosen;
+            var alt = plan.Alts[chosen];
+            alt.AlphaCost = alphaCost;
+            plan.Alts[chosen] = alt;
+            plan.ChosenAlphaCost = alphaCost;
+            plan.BestAlphaCost = alphaCost; // certificate certifies the driven route
             plan.ChosenEdgePath.Clear();
-            plan.ChosenEdgePath.AddRange(_acceptedGeomsScratch[best]);
+            plan.ChosenEdgePath.AddRange(_chosenBuf);
+            return true;
         }
 
         /// <summary>Re-expand geometry for an alternative (used when Layer 4
@@ -590,6 +696,44 @@ namespace CS2Path.Core
             float d1 = _q.Distance(_ctx, fromNode, alt.ViaNode, k);
             if (float.IsPositiveInfinity(d1)) return d1;
             return d1 + _q.Distance(_ctx, alt.ViaNode, alt.Destination, k);
+        }
+
+        /// <summary>Blended re-price for Layer-4 SWITCHING comparisons: live cost
+        /// mixed with the stable scenario (typical when present, else free-flow)
+        /// by TypicalBlend. Switching on raw live costs re-creates herding at
+        /// decision points — the same lesson as choice-time blending.</summary>
+        public float RepriceAlternativeBlended(int fromNode, in Alternative alt, int profile)
+        {
+            float live = RepriceAlternative(fromNode, alt, profile);
+            float w = Cfg.TypicalBlend;
+            if (w <= 0f || float.IsPositiveInfinity(live)) return live;
+            int stableK = (_hasTypical ? _anchors.ScenarioBlockStart(Scenario.Typical)
+                                       : _anchors.ScenarioBlockStart(Scenario.FreeFlow)) + profile;
+            float s1 = _q.Distance(_ctx, fromNode, alt.ViaNode, stableK);
+            if (float.IsPositiveInfinity(s1)) return live;
+            float stable = s1 + _q.Distance(_ctx, alt.ViaNode, alt.Destination, stableK);
+            if (float.IsPositiveInfinity(stable)) return live;
+            return (1 - w) * live + w * stable;
+        }
+
+        /// <summary>Blended remaining cost of the driven path (see
+        /// RepriceAlternativeBlended): one pass summing both scenarios.</summary>
+        public float RemainingPathCostBlended(List<int> path, int cursor, int profile)
+        {
+            float w = Cfg.TypicalBlend;
+            int kLive = LiveMetric(profile);
+            if (w <= 0f) return RemainingPathCost(path, cursor, profile);
+            int kStable = (_hasTypical ? _anchors.ScenarioBlockStart(Scenario.Typical)
+                                       : _anchors.ScenarioBlockStart(Scenario.FreeFlow)) + profile;
+            float live = 0f, stable = 0f;
+            for (int i = cursor; i < path.Count; i++)
+            {
+                float wl = _anchors.EdgeWeight(_g, path[i], kLive);
+                if (float.IsPositiveInfinity(wl)) return float.PositiveInfinity;
+                live += wl;
+                stable += _anchors.EdgeWeight(_g, path[i], kStable);
+            }
+            return (1 - w) * live + w * stable;
         }
 
         public float ProbeDirect(int fromNode, int dest, int profile)
