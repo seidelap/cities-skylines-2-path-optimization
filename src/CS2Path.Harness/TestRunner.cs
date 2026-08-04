@@ -646,8 +646,11 @@ namespace CS2Path.Harness
             var rng = new SplitMix64(seed);
             var ods = new List<(int s, int t)>();
             for (int i = 0; i < 50; i++) ods.Add((rng.NextInt(g.NodeCount), rng.NextInt(g.NodeCount)));
+            // 6 reps so every OD's entry crosses the ≥5-sample confidence
+            // support on its own, without depending on the partitioner's cell
+            // shapes making two ODs share an entry.
             int blendViolations = 0;
-            for (int rep = 0; rep < 3; rep++)
+            for (int rep = 0; rep < 6; rep++)
                 foreach (var (s, t) in ods)
                 {
                     var plan = planner.PlanFixed(new TripRequest

@@ -24,6 +24,11 @@ namespace CS2Path.Harness
             string cmd = args.Length > 0 ? args[0] : "all";
             var opts = ParseOpts(args);
             ulong seed = (ulong)GetOpt(opts, "seed", 20260804);
+            if (opts.TryGetValue("partitioner", out var part))
+            {
+                NestedDissection.UseInertialFlow = part != "geometric";
+                Console.WriteLine($"partitioner: {(NestedDissection.UseInertialFlow ? "inertial-flow" : "geometric")}");
+            }
             switch (cmd)
             {
                 case "verify":
@@ -94,10 +99,10 @@ namespace CS2Path.Harness
                     Console.WriteLine("NOTE: topology is real; edge weights are synthesised (structure, not cost, is");
                     Console.WriteLine("      what A1 measures — the CCH skeleton is metric-independent).");
                     Console.WriteLine(hasCoords
-                        ? "      Real coordinates present: geometric nested dissection is used."
-                        : "      No coordinates: nested dissection falls back to BFS bisection, which is the");
+                        ? "      Real coordinates present: inertial-flow nested dissection is used."
+                        : "      No coordinates: nested dissection uses a BFS-level embedding as the flow");
                     if (!hasCoords)
-                        Console.WriteLine("      weaker path — treat the result as a pessimistic bound.");
+                        Console.WriteLine("      projection — weaker seeding than real geometry, but still a min-cut.");
                     return 0;
                 }
                 case "export-synthetic":

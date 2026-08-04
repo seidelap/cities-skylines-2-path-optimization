@@ -15,7 +15,8 @@ queries in microseconds** — and makes change propagation, not recomputation, t
 
 ```
 src/CS2Path.Core/      Pure routing core — NO game assembly references (plan §5)
-  NestedDissection.cs    Layer 0: metric-independent elimination order (separator-based)
+  NestedDissection.cs    Layer 0: metric-independent elimination order (Inertial Flow
+                                  min-cut separators; geometric sweep on small cells)
   CchSkeleton.cs         Layer 0: contraction with ALL shortcuts (chordal supergraph)
   AnchorGrid.cs          Layer 1: preference-profile × scenario anchor metrics
   CchMetrics.cs          Layer 1: vectorized multi-metric triangle-sweep customization,
@@ -69,7 +70,7 @@ Measured results: see [`RESULTS.md`](RESULTS.md).
 
 | Plan | Where | Notes |
 |---|---|---|
-| §4 L0 structure, no witness searches | `NestedDissection`, `CchSkeleton` | geometric bisection when coordinates exist, BFS level-set fallback otherwise |
+| §4 L0 structure, no witness searches | `NestedDissection`, `CchSkeleton` | Inertial Flow separators (max-flow min-cut seeded by geometric quarters) on large cells, min-crossing geometric sweep on small ones, min-degree base-cell ordering; coordinate-less graphs use a BFS-level embedding as the flow projection |
 | §4 L0 lazy edits | `RoutingEngine`, `CchMetrics` | closures/removals are instant metric edits (+inf via partial customization); additions rebuild asynchronously and swap atomically — nothing blocks |
 | §4 L1 anchor grid | `AnchorGrid` | axes mandatory (positively spans the preference cone), k-means centroids for the rest, trip-frequency weighted |
 | §4 L1 customization | `CchMetrics` | one bottom-up min-plus sweep carries all K metrics through SIMD lanes; partial customization propagates only while a min actually changes |
