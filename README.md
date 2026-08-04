@@ -133,3 +133,20 @@ Measured results: see [`RESULTS.md`](RESULTS.md).
 * **In-game ECS wiring** — `CS2Path.Mod` documents but stubs the two adapters; compiling
   against `Game.dll` and shipping through the game's Mods folder happens in the game build,
   per the version-pinning discipline in plan §5.
+
+## Running the game (and this mod) without a Windows PC
+
+`deploy/gcp/` provisions a Windows + NVIDIA workstation on GCP that you stream to a
+Mac, doubling as the build/test machine for plan §5 steps 1–3. Compute scales to zero
+between sessions (idle shutdown + a hard session cap); a hibernate command drops idle
+cost to roughly snapshot storage. See [`deploy/gcp/README.md`](deploy/gcp/README.md)
+for the cost model, the GPU-quota prerequisite, and the calibration loop:
+
+```
+CS2 + exporter mod  ──►  .cs2city export  ──►  harness import  ──►  A1 / A2 verdicts
+```
+
+`harness import` replays a real exported city and reports the two assumptions every
+current benchmark rests on — separator quality (elimination-tree height vs the
+synthetic 264) and demand locality (cache hit rate vs the synthetic 84.2%). The loop
+is exercisable today with `export-synthetic` before the in-game exporter exists.

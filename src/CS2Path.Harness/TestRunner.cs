@@ -53,6 +53,8 @@ namespace CS2Path.Harness
             VerifyWindowedDetector(seed + 12);
             Console.WriteLine("verify: event-driven bucket refresh == blind refresh...");
             VerifyEventDrivenBuckets(seed + 13);
+            Console.WriteLine("verify: city-export round trip (format + corruption detection)...");
+            VerifyCityExport(seed + 15);
             Console.WriteLine("verify: §4.9 cluster cache (hits, quarantine, async exploration)...");
             VerifyClusterCache(seed + 11);
             Console.WriteLine("verify: cache remap after re-dissection, warmup governor, telemetry...");
@@ -559,6 +561,77 @@ namespace CS2Path.Harness
             Console.WriteLine($"  cache: hits={cache.Hits} misses={cache.Misses} entries={cache.EntryCount} " +
                               $"servedFromCache={planner.Stats.ServedFromCache} quarantineDiversions={planner.Stats.QuarantineDiversions} " +
                               $"explored={tasks} donated={planner.Stats.ExplorationDonated}");
+        }
+
+        private static void VerifyCityExport(ulong seed)
+        {
+            // The export format is the seam between the game and this harness; a
+            // silent drift here would invalidate every calibration measurement,
+            // so round-trip it exactly and prove corruption is caught.
+            var city = SyntheticCity.Build(30, 30, 500, 60, seed);
+            var exp = CityExport.FromGraph(city.G, city.JamCapacity);
+            var rng = new SplitMix64(seed);
+            for (int i = 0; i < 400; i++)
+                exp.Traffic.Add(new CityExport.TrafficSample
+                { Tick = rng.NextInt(500), Edge = rng.NextInt(city.G.EdgeCount), LiveSeconds = 1f + 20f * rng.NextFloat() });
+            for (int i = 0; i < 300; i++)
+                exp.Demand.Add(new CityExport.DemandSample
+                {
+                    Tick = rng.NextInt(500),
+                    Origin = rng.NextInt(city.G.NodeCount), Dest = rng.NextInt(city.G.NodeCount),
+                    Alpha = city.Citizens[rng.NextInt(city.Citizens.Length)],
+                });
+
+            var ms = new System.IO.MemoryStream();
+            exp.Write(ms);
+            ms.Position = 0;
+            var back = CityExport.Read(ms);
+
+            int bad = 0;
+            if (back.NodeCount != exp.NodeCount || back.EdgeCount != exp.EdgeCount) bad++;
+            for (int e = 0; e < exp.EdgeCount && bad == 0; e++)
+                if (back.Tail[e] != exp.Tail[e] || back.Head[e] != exp.Head[e]
+                    || back.TimeFree[e] != exp.TimeFree[e] || back.Money[e] != exp.Money[e]
+                    || back.Comfort[e] != exp.Comfort[e] || back.Capacity[e] != exp.Capacity[e]
+                    || back.JamCapacity[e] != exp.JamCapacity[e]) bad++;
+            for (int v = 0; v < exp.NodeCount && bad == 0; v++)
+                if (back.X[v] != exp.X[v] || back.Y[v] != exp.Y[v]) bad++;
+            Check(bad == 0, $"city export round trip lost data ({bad} mismatches)");
+            Check(back.Traffic.Count == exp.Traffic.Count && back.Demand.Count == exp.Demand.Count,
+                "city export lost trace sections");
+            for (int i = 0; i < exp.Demand.Count; i++)
+                if (back.Demand[i].Origin != exp.Demand[i].Origin || back.Demand[i].Dest != exp.Demand[i].Dest
+                    || back.Demand[i].Alpha.Time != exp.Demand[i].Alpha.Time) { bad++; break; }
+            Check(bad == 0, "city export demand trace mismatch");
+
+            // rebuilt graph must route identically to the original
+            var g2 = back.ToGraph();
+            var a2 = AnchorGrid.Build(new List<Preference>(), null, 3, new[] { Scenario.FreeFlow, Scenario.Live });
+            var eng2 = RoutingEngine.Build(g2, a2);
+            var ctx2 = eng2.Query.CreateContext();
+            int routeBad = 0;
+            for (int i = 0; i < 100; i++)
+            {
+                int s = rng.NextInt(g2.NodeCount), t = rng.NextInt(g2.NodeCount);
+                float dc = eng2.Query.Distance(ctx2, s, t, 0);
+                float dr = Reference.Dijkstra(g2, s, t, e => a2.EdgeWeight(g2, e, 0));
+                if (!Close(dc, dr)) routeBad++;
+            }
+            Check(routeBad == 0, $"imported graph routes differently ({routeBad} mismatches)");
+
+            // corruption must be caught, not silently imported
+            var bytes = ms.ToArray();
+            bytes[bytes.Length / 2] ^= 0xFF;
+            bool caught = false;
+            try { CityExport.Read(new System.IO.MemoryStream(bytes)); }
+            catch (System.IO.InvalidDataException) { caught = true; }
+            catch (Exception) { caught = true; }
+            Check(caught, "corrupted export was accepted instead of rejected");
+
+            bool truncCaught = false;
+            try { CityExport.Read(new System.IO.MemoryStream(ms.ToArray(), 0, (int)(ms.Length / 2))); }
+            catch (Exception) { truncCaught = true; }
+            Check(truncCaught, "truncated export was accepted instead of rejected");
         }
 
         private static void VerifyCacheV4(ulong seed)

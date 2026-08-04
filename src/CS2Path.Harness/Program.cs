@@ -55,6 +55,38 @@ namespace CS2Path.Harness
                     Console.WriteLine("\nwrote results-commute.md");
                     return 0;
                 }
+                case "import":
+                {
+                    if (!opts.TryGetValue("file", out var path))
+                    { Console.WriteLine("usage: harness import --file <city.cs2city> [--profiles N] [--queries N]"); return 2; }
+                    var md = ImportedCity.Analyze(path, (int)GetOpt(opts, "profiles", 8), seed,
+                                                  (int)GetOpt(opts, "queries", 20_000));
+                    File.WriteAllText("results-import.md", md);
+                    Console.WriteLine("\nwrote results-import.md");
+                    return 0;
+                }
+                case "export-synthetic":
+                {
+                    // Produces a .cs2city from the synthetic city — lets the whole
+                    // export→transfer→import loop be exercised before the in-game
+                    // exporter exists.
+                    string outPath = opts.TryGetValue("out", out var o) ? o : "synthetic.cs2city";
+                    int c2 = (int)GetOpt(opts, "cols", 120), r2 = (int)GetOpt(opts, "rows", 120);
+                    var sc = SyntheticCity.Build(c2, r2, 5000, 300, seed);
+                    var exp = CityExport.FromGraph(sc.G, sc.JamCapacity);
+                    var erng = new SplitMix64(seed);
+                    for (int i = 0; i < 5000; i++)
+                        exp.Demand.Add(new CityExport.DemandSample
+                        {
+                            Tick = erng.NextInt(1000),
+                            Origin = erng.NextInt(sc.G.NodeCount), Dest = erng.NextInt(sc.G.NodeCount),
+                            Alpha = sc.Citizens[erng.NextInt(sc.Citizens.Length)],
+                        });
+                    using (var fs = File.Create(outPath)) exp.Write(fs);
+                    Console.WriteLine($"wrote {outPath} ({new FileInfo(outPath).Length / 1e6:0.0} MB, " +
+                                      $"{exp.NodeCount:N0} nodes, {exp.EdgeCount:N0} edges, {exp.Demand.Count:N0} trips)");
+                    return 0;
+                }
                 case "all":
                 {
                     var sb = new StringBuilder(Header());
@@ -75,7 +107,9 @@ namespace CS2Path.Harness
                     return rc;
                 }
                 default:
-                    Console.WriteLine("usage: harness [verify|bench|herding|sim|all] [--key value ...]");
+                    Console.WriteLine("usage: harness [verify|bench|herding|sim|commute|all] [--key value ...]");
+                    Console.WriteLine("       harness export-synthetic [--out city.cs2city]");
+                    Console.WriteLine("       harness import --file <city.cs2city>   # replay a real exported city");
                     return 2;
             }
         }

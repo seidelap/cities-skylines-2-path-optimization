@@ -1,21 +1,70 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!-- Game-facing adapter skeleton (plan §5). This project holds the ONLY two
-       classes that are allowed to touch Colossal Order code: the reader adapter
-       (ECS -> IGraphSource/IMetricFeed/IWorldEvents) and the writer adapter
-       (PlanPortfolio -> PathOwner/CarNavigation components). In this repository
-       it compiles against Core only, with the game touchpoints stubbed and
-       documented; wiring to Game.dll happens in the game's Mods build. -->
+  <!-- Game-facing adapter (plan §5). This project holds the ONLY classes allowed
+       to touch Colossal Order code: the reader adapter (ECS -> IGraphSource /
+       IMetricFeed / IWorldEvents), the writer adapter (PlanPortfolio ->
+       PathOwner / CarNavigation), and the city exporter.
+
+       Two build modes:
+         * default (this repo, CI, any machine): OUT_OF_GAME_BUILD — game
+           touchpoints compile as documented stubs, so the seam stays type-checked
+           without the non-redistributable game assemblies.
+         * in-game:  dotnet build -p:InGame=true -p:GameManagedDir="<...>\Cities2_Data\Managed"
+           references the installed game's managed assemblies. Run this ON the
+           machine that has CS2 installed (see deploy/gcp). -->
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <InGame Condition="'$(InGame)' == ''">false</InGame>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(InGame)' != 'true'">
     <DefineConstants>$(DefineConstants);OUT_OF_GAME_BUILD</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="../CS2Path.Core/CS2Path.Core.csproj" />
   </ItemGroup>
+
+  <!-- In-game only: reference the installed game's assemblies. These are never
+       redistributed and never committed; they exist only on a machine that owns
+       the game. -->
+  <ItemGroup Condition="'$(InGame)' == 'true'">
+    <Reference Include="Game">
+      <HintPath>$(GameManagedDir)\Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Core">
+      <HintPath>$(GameManagedDir)\Colossal.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Colossal.Logging">
+      <HintPath>$(GameManagedDir)\Colossal.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Entities">
+      <HintPath>$(GameManagedDir)\Unity.Entities.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Collections">
+      <HintPath>$(GameManagedDir)\Unity.Collections.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Mathematics">
+      <HintPath>$(GameManagedDir)\Unity.Mathematics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="CheckGameDir" BeforeTargets="Build" Condition="'$(InGame)' == 'true'">
+    <Error Condition="!Exists('$(GameManagedDir)\Game.dll')"
+           Text="InGame=true requires -p:GameManagedDir pointing at Cities2_Data\Managed (Game.dll not found at '$(GameManagedDir)')." />
+  </Target>
 
 </Project>
