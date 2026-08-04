@@ -156,39 +156,39 @@ telemetry (gap mass per entry) is the §4.8 anchor-adaptation instrument.
 | warm-up governor (gap #2, harness half) | 25-trip cold storm bounded to 3 direct generations; 25/25 trips still planned via thin service + urgent exploration |
 | warm/cold with telemetry active | 84.2% hit rate; warm 2,366 µs vs cold 6,005 µs median (2.5×) |
 
-### Adaptive departure timing (opportunity #1)
+### Adaptive departure timing (opportunity #1) — corrected stats (post-review fixes)
 
 10,000 commuters, 8 days × 700 ticks (120x120 city). Adaptive: depart = target − (entry commute mean + k·deviation) − jitter, learned from cluster-entry realized telemetry. Fixed: depart = target − 1.25×free-flow estimate − jitter.
 
 | day | mode | mean travel (ticks) | mean lateness | mean \|lateness\| | >10 ticks late | depart std | arrive std |
 |---|---|---|---|---|---|---|---|
-| 0 | fixed | 128.3 | +13.0 | 54.0 | 52.0 % | 64.7 | 50.5 |
-| 1 | fixed | 130.7 | +15.4 | 54.7 | 53.9 % | 64.7 | 51.0 |
-| 2 | fixed | 130.2 | +14.9 | 54.3 | 53.4 % | 64.7 | 50.5 |
-| 3 | fixed | 129.4 | +14.1 | 53.9 | 52.4 % | 64.7 | 50.2 |
-| 4 | fixed | 130.2 | +14.9 | 53.5 | 53.5 % | 64.7 | 49.3 |
-| 5 | fixed | 129.4 | +14.1 | 53.2 | 53.1 % | 64.7 | 49.0 |
-| 6 | fixed | 130.0 | +14.7 | 54.0 | 53.3 % | 64.7 | 50.1 |
-| 7 | fixed | 130.4 | +15.1 | 54.2 | 53.8 % | 64.7 | 50.1 |
-| 0 | adaptive | 128.5 | +13.2 | 54.1 | 52.1 % | 64.7 | 50.8 |
-| 1 | adaptive | 119.9 | -38.9 | 74.7 | 28.5 % | 84.7 | 73.0 |
-| 2 | adaptive | 123.4 | -17.6 | 62.8 | 37.1 % | 70.3 | 63.5 |
-| 3 | adaptive | 121.2 | -25.7 | 69.1 | 31.8 % | 77.0 | 71.0 |
-| 4 | adaptive | 122.6 | -25.4 | 64.5 | 32.7 % | 71.6 | 64.0 |
-| 5 | adaptive | 121.6 | -32.2 | 67.8 | 30.4 % | 75.1 | 66.2 |
-| 6 | adaptive | 122.5 | -24.1 | 63.2 | 33.1 % | 70.0 | 62.5 |
-| 7 | adaptive | 122.3 | -29.7 | 66.4 | 31.2 % | 74.2 | 65.0 |
+| 0 | fixed | 128.2 | +12.9 | 15.4 | 43.1 % | 64.7 | 50.4 |
+| 1 | fixed | 128.9 | +13.6 | 16.2 | 41.7 % | 64.7 | 51.3 |
+| 2 | fixed | 129.1 | +13.8 | 16.2 | 43.7 % | 64.7 | 51.1 |
+| 3 | fixed | 128.9 | +13.6 | 15.9 | 44.7 % | 64.7 | 50.7 |
+| 4 | fixed | 129.2 | +13.9 | 16.3 | 41.4 % | 64.7 | 51.4 |
+| 5 | fixed | 129.4 | +14.1 | 16.5 | 45.5 % | 64.7 | 50.1 |
+| 6 | fixed | 130.3 | +15.0 | 17.2 | 46.0 % | 64.7 | 50.8 |
+| 7 | fixed | 129.1 | +13.8 | 15.9 | 48.7 % | 64.7 | 49.3 |
+| 0 | adaptive | 128.2 | +12.9 | 15.4 | 43.1 % | 64.7 | 50.4 |
+| 1 | adaptive | 125.9 | -66.8 | 68.6 | 2.4 % | 87.3 | 66.7 |
+| 2 | adaptive | 126.5 | -57.4 | 59.3 | 2.5 % | 88.9 | 64.4 |
+| 3 | adaptive | 125.0 | -59.4 | 60.9 | 2.0 % | 85.8 | 62.7 |
+| 4 | adaptive | 124.4 | -60.1 | 61.4 | 1.8 % | 88.0 | 65.2 |
+| 5 | adaptive | 123.7 | -58.9 | 60.1 | 1.7 % | 84.9 | 62.3 |
+| 6 | adaptive | 122.9 | -58.5 | 59.7 | 1.7 % | 86.8 | 65.2 |
+| 7 | adaptive | 123.3 | -56.0 | 57.3 | 2.0 % | 84.4 | 62.0 |
 
 Adaptive departures learn from the same shared telemetry that feeds predictive pricing; per-agent heterogeneity (k, jitter) plus slow EMAs prevent departure-herding.
 
-
-**Reading the commute A/B honestly:** peak-spreading equilibrium is real — adaptive travel
-time drops ~6% and holds across days with no departure-herding — and severe lateness
-(>10 ticks) halves (53% → 31%). Mean |lateness| rises because the mean + k·deviation rule
-is risk-averse by construction and the slow EMA lags the improvement it causes (agents
-spread the peak → trips speed up → the learned mean stays high → early arrivals). The
-overshoot damps across days (−38.9 → ≈−25) but 8 days is not equilibrium; k and the
-buffer asymmetry are §4.8-style empirical knobs.
+**Reading the corrected commute A/B** (the pre-fix per-day stats were computed over a
+depart-order-shuffled index and are superseded): the reliability win is dramatic —
+severe lateness (>10 ticks) collapses from ~44% to **~2%** and holds, and travel time
+drifts down ~4-5% across days as the peak spreads. The cost is heavy early arrival
+(mean ≈ −58 ticks): the mean + k·deviation rule with k ∈ [0.5, 2] prices commute
+variance very conservatively. That asymmetry is a policy knob, not a bug — commuters
+who must not be late rationally buy earliness — but k (and an asymmetric lateness
+loss) belongs in the §4.8 empirical outer loop.
 
 ## Herding A/B (synchronized-demand stress test)
 
@@ -202,12 +202,12 @@ gridlock. The rebuild is stable under BOTH regimes.
 | signal regime | mode | oscillation (std of corridor share) | mean travel (ticks) |
 |---|---|---|---|
 | fast | vanilla | 0.4178 | 78.7 |
-| fast | **rebuild** | **0.1331** | **69.1** |
+| fast | **rebuild** | **0.0686** | **69.0** |
 | slow | vanilla | 0.0000 (gridlocked) | 181.8 |
-| slow | **rebuild** | **0.0466** | **69.0** |
+| slow | **rebuild** | **0.0450** | **69.0** |
 
-**Fast regime: oscillation amplitude 3.1× below vanilla** (§6 target ≥ 5×).
-**Slow regime: vanilla collapses into gridlock (2.6× the rebuild's travel time); the rebuild stays near-stationary (0.0466).**
+**Fast regime: oscillation amplitude 6.1× below vanilla** (§6 target ≥ 5×).
+**Slow regime: vanilla collapses into gridlock (2.6× the rebuild's travel time); the rebuild stays near-stationary (0.0450).**
 
 The damping comes from the §4 trio — logit noise over genuinely comparable
 alternatives, switch hysteresis, arrival-ordered decision-point replanning — plus the typical-scenario
@@ -223,17 +223,17 @@ non-monotonic in the blend/noise parameters (0.6/0.10 measured best;
 
 | measure | value |
 |---|---|
-| wall time | 1,622 s (3.7x realtime) |
+| wall time | 1,593 s (3.8x realtime) |
 | arrivals | 99,976 / 100,000 |
 | trips planned (incl. regenerations) | 100,000 |
-| certified-exact fraction | 38.4 % |
-| planning time | 315.9 s total, 3,159 µs/trip |
-| movement | 15.32 ms/tick |
-| live-metric partial customization | 1800.32 ms/refresh |
-| Layer-4 wakes + re-pricing | 2450.86 ms/refresh |
-| re-prices / probes / regenerations | 2,158,557 / 0 / 0 |
-| route switches (past hysteresis) | 2,240 |
-| event wakes (metered) / region wakes / sweeper | 0 / 0 / 4,392 |
+| certified-exact fraction | 38.6 % |
+| planning time | 340.8 s total, 3,408 µs/trip |
+| movement | 12.02 ms/tick |
+| live-metric partial customization | 1800.38 ms/refresh |
+| Layer-4 wakes + re-pricing | 2284.55 ms/refresh |
+| re-prices / probes / regenerations | 2,158,875 / 0 / 0 |
+| route switches (past hysteresis) | 2,260 |
+| event wakes (metered) / region wakes / sweeper | 0 / 0 / 4,463 |
 | soft-closed edges at end | 0 |
 | unreachable-trip events | 0 |
 
@@ -246,7 +246,7 @@ non-monotonic in the blend/noise parameters (0.6/0.10 measured best;
 | full customization < 10 ms | 1.06 s (16 metrics, single-thread C#) | miss on absolute; the sweep is SIMD-lane-parallel and level-parallelizable — Burst-class headroom is large but this target is at risk and should be re-measured in-game |
 | typical partial customization < 1 ms | 9.4 ms median for a clustered congestion pocket (3,630 of 2.2M arcs — 0.16%); scattered random edges 132 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 4.0× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
-| oscillation amplitude reduced ≥ 5× | 4.2× vs the oscillating vanilla regime; vanilla's gridlock regime avoided entirely (2.6× travel-time win) | near target; damping is non-monotonic in blend/noise — belongs in §4.8's empirical outer loop |
+| oscillation amplitude reduced ≥ 5× | **6.1×** vs the oscillating vanilla regime (fast signal, after unit-consistent blended switching); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |
 | zero increase in unreachable-trip failures | 0 unreachable events across bench + 100k-trip sim | met |
 | certified-exact ≥ 90%, mean gap < 1% | 77.8% certified at plan time (cold planner), gaps now logged as per-entry exploration demand rather than repaired synchronously | miss on the fraction; k-sweep shows anchor count is not the lever — §4.8 online adaptation consumes exactly the telemetry now emitted |
 | exploration fully off critical path; sync fallback p99 < 0.5 ms (§6 v2) | 0 synchronous repairs; exploration budgeted off-path (~2.6 ms/task C#); 0 sync fallbacks needed, bounded by one CCH query (p99 154 µs) | met |
