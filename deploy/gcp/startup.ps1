@@ -124,8 +124,20 @@ $managed = Join-Path $GameDir "Cities2_Data\Managed"
 if (-not (Test-Path $managed)) { Write-Error "Managed dir not found under $GameDir"; exit 1 }
 Write-Host "Game assemblies: $managed"
 
+$toolpath = [System.Environment]::GetEnvironmentVariable("CSII_TOOLPATH", "User")
+if (-not $toolpath -or -not (Test-Path (Join-Path $toolpath "Mod.props"))) {
+  Write-Error @"
+The official CS2 modding toolchain is not installed.
+Launch the game once and enable it under Options -> Modding; it sets the
+CSII_TOOLPATH user environment variable that this build imports.
+(Current CSII_TOOLPATH: '$toolpath')
+"@
+  exit 1
+}
+Write-Host "Toolchain: $toolpath"
+
 $repo = "D:\src\cs2path"
-dotnet build "$repo\src\CS2Path.Mod\CS2Path.Mod.csproj" -c Release -p:GameManagedDir="$managed" -p:InGame=true
+dotnet build "$repo\src\CS2Path.Mod\CS2Path.Mod.csproj" -c Release -p:InGame=true
 if ($LASTEXITCODE -ne 0) { Write-Error "build failed"; exit 1 }
 
 $mods = Join-Path $env:LOCALAPPDATA "Colossal Order\Cities Skylines II\Mods\CS2Path"

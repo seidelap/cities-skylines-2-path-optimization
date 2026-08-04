@@ -12,11 +12,28 @@ namespace CS2Path.Mod
     // component or reshapes a system, the diff-and-repair work is confined
     // to this file.
     //
-    // In-game wiring (documented here, implemented in the game build):
-    //  * A ModSystemBase subclass disables the vanilla PathfindSetupSystem /
-    //    query drain via World.GetOrCreateSystemManaged(...).Enabled = false
-    //    (the sanctioned wholesale-replacement pattern — the Burst hot path
-    //    cannot be Harmony-patched) and registers the replacement systems.
+    // In-game wiring. The following API facts are VERIFIED against shipped
+    // open-source CS2 mods (krzychu124/Traffic), not inferred:
+    //  * Entry point is `public class Mod : IMod` from the `Game.Modding`
+    //    namespace, implementing OnLoad(UpdateSystem) and OnDispose().
+    //  * Systems are registered through the UpdateSystem passed to OnLoad:
+    //      updateSystem.UpdateAt<T>(SystemUpdatePhase.X)
+    //      updateSystem.UpdateBefore<A, B>(SystemUpdatePhase.X)
+    //      updateSystem.UpdateAfter<A, B>(SystemUpdatePhase.X)
+    //    Real phase names include Deserialize, Modification3/4/5,
+    //    ModificationEnd, ToolUpdate, ApplyTool, Rendering, UIUpdate.
+    //  * Network components live under `Game.Net`.
+    //  * The project builds against the official toolchain via CSII_TOOLPATH ->
+    //    Mod.props / Mod.targets (see CS2Path.Mod.csproj), NOT hand-rolled
+    //    HintPaths into Cities2_Data\Managed.
+    //
+    //  * The vanilla pathfinding systems are disabled via
+    //    World.GetOrCreateSystemManaged(...).Enabled = false (the sanctioned
+    //    wholesale-replacement pattern — the Burst hot path cannot be
+    //    Harmony-patched); the replacement systems are then registered above.
+    //    STILL UNVERIFIED: the exact vanilla system type names to disable, and
+    //    the exact Game.Net component/buffer names for lanes and connections.
+    //    Read those off a network-touching mod before writing the exporter body.
     //  * Feature flags (FeatureFlags) are surfaced as mod options so every
     //    layer is independently revertible to vanilla behavior at runtime.
     //  * Version discipline: pin game version, per patch decompile + diff the
