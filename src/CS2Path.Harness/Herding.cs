@@ -256,7 +256,7 @@ namespace CS2Path.Harness
             sb.AppendLine($"**Slow regime: vanilla collapses into gridlock ({vanS.MeanTravelTicks / Math.Max(1, rebS.MeanTravelTicks):0.0}× the rebuild's travel time); the rebuild stays near-stationary ({rebS.Amplitude:0.0000}).**");
             sb.AppendLine();
             sb.AppendLine("The damping comes from the §4 trio — logit noise over genuinely comparable");
-            sb.AppendLine("alternatives, switch hysteresis, staggered refresh — plus the typical-scenario");
+            sb.AppendLine("alternatives, switch hysteresis, arrival-ordered decision-point replanning — plus the typical-scenario");
             sb.AppendLine("blend in the choice utility (§4 L1's rolling-average scenario axis) and");
             sb.AppendLine("cross-scenario portfolio retention (§4.8). Tuning note: damping is");
             sb.AppendLine("non-monotonic in the blend/noise parameters (0.6/0.10 measured best;");
