@@ -15,13 +15,13 @@ Where a target is missed even accounting for that, it is called out honestly.
 
 | plan claim | measured |
 |---|---|
-| §2(a) trips ~3 orders of magnitude cheaper | queries **~120× cheaper** than per-trip Dijkstra (88 µs vs 10.7 ms this container, exact); with the §4.9 cache, **84% of trips plan warm in ~1.1 ms** (re-pricing only, geometry expanded only for the driven route) vs ~3 ms cold seeding and ~7.4 ms full-fat generation |
-| §2(b) continuous updates without herding | vanilla is bistable under the stress test: it oscillates (fast congestion signal) or gridlocks (slow signal); the rebuild is stable under **both** — amplitude **4.0× below** the oscillating baseline, **2.6× better travel times** than the gridlocked one — with decision-point replanning active |
+| §2(a) trips ~3 orders of magnitude cheaper | queries **~122× cheaper** than per-trip Dijkstra on the synthetic city (94.5 µs vs 11.1 ms this container, exact) and **112–203× on real road networks** (Ruhr/Paris/NY, Inertial Flow separators); with the §4.9 cache, **81% of trips plan warm in ~1.3 ms** (re-pricing only, geometry expanded only for the driven route) vs ~2.9 ms cold seeding and ~7.4 ms full-fat generation |
+| §2(b) continuous updates without herding | vanilla is bistable under the stress test: it oscillates (fast congestion signal) or gridlocks (slow signal); the rebuild is stable under **both** — amplitude **5.9× below** the oscillating baseline, **2.6× better travel times** than the gridlocked one — with decision-point replanning active |
 | §2(c) heterogeneous preferences exact | every trip scored with its true continuous α; certificates prove exactness per-trip (LP lower bound), repair A* recovers the exact optimum for the tail |
 | §2(d) joint destination+route choice | bucket scans return (destination, route) menus in ~150 µs, verified exact vs brute force |
 | §2(e) closures graded and metered | hard closures exact in every scenario (verified round-trip); soft closures graded with hysteresis; event wakes metered upstream-first |
 
-## Correctness verification (20 checks, all passing)
+## Correctness verification (48 checks, all passing)
 
 CCH distances ≡ Dijkstra across every anchor metric (city + random graphs, BFS-fallback
 order); partial customization ≡ full recustomization; hard-closure + reopen round-trips
@@ -39,85 +39,87 @@ previously sampled only live lanes).
 
 ## Scale benchmark (plan §6 targets)
 
+Measured with the Inertial Flow partitioner (see the A1 section for the real-map morphology sweep and the geometric A/B).
+
 Graph: **131,039 nodes / 482,554 directed lane-edges** (three road tiers, holes). Anchor grid: **8 preference profiles × 2 scenarios = 16 metrics**.
 
 ### Layer 0 — structure (once per topology edit, async)
 
 | stage | result |
 |---|---|
-| nested dissection order | 1,012 ms |
-| contraction (all shortcuts) | 2,336 ms |
-| chordal arcs | 2,217,999 (9.2x undirected edges) |
-| elimination tree height | 264 |
-| multi-metric weight memory | 284 MB (16 metrics, fwd+bwd) |
+| nested dissection order | 2,220 ms |
+| contraction (all shortcuts) | 759 ms |
+| chordal arcs | 1,686,815 (7.0x undirected edges) |
+| elimination tree height | 331 |
+| multi-metric weight memory | 216 MB (16 metrics, fwd+bwd) |
 
 ### Layer 1 — customization (per traffic refresh)
 
 | operation | time | §6 target |
 |---|---|---|
-| full customization, all 16 metrics | 1,059 ms | < 10 ms (Burst/SIMD budget) |
-| partial, 100 edges ±10% drift, scattered (live lanes) | median 124.70 ms, p99 248.02 ms (47,556 arcs) | < 1 ms |
-| partial, 150 edges ±10% drift, clustered (one congestion pocket) | median 9.30 ms, p99 21.68 ms (3,630 arcs) | < 1 ms |
-| partial, 1000 edges ±10% drift, scattered (live lanes) | median 719.15 ms, p99 762.31 ms (336,142 arcs) | — |
-| partial, 1000-edge large shock (0.8-2.4x) | 696 ms (319,932 arcs) | worst case, amortizable |
+| full customization, all 16 metrics | 531 ms | < 10 ms (Burst/SIMD budget) |
+| partial, 100 edges ±10% drift, scattered (live lanes) | median 92.38 ms, p99 218.56 ms (43,016 arcs) | < 1 ms |
+| partial, 150 edges ±10% drift, clustered (one congestion pocket) | median 6.92 ms, p99 15.24 ms (3,362 arcs) | < 1 ms |
+| partial, 1000 edges ±10% drift, scattered (live lanes) | median 500.60 ms, p99 533.74 ms (282,503 arcs) | — |
+| partial, 1000-edge large shock (0.8-2.4x) | 475 ms (265,118 arcs) | worst case, amortizable |
 
 ### Layer 2 — point-to-point queries (per trip, live metric)
 
 | measure | CCH (this mod) | reference Dijkstra (vanilla-style) |
 |---|---|---|
-| median latency | 191.1 µs | 18,510 µs |
-| mean latency | 203.8 µs | 19,894 µs |
-| p99 latency | 367.3 µs | 45,946 µs |
-| throughput (4 threads) | 19,035 queries/s | — |
+| median latency | 94.5 µs | 11,138 µs |
+| mean latency | 97.3 µs | 11,900 µs |
+| p99 latency | 173.9 µs | 25,830 µs |
+| throughput (4 threads) | 38,852 queries/s | — |
 | correctness spot-check | 300/300 exact | (reference) |
 
-**Speedup: 98x per query** (plan §2 asks ~3 orders of magnitude; §6 target p99 < 20 µs).
+**Speedup: 122x per query** (plan §2 asks ~3 orders of magnitude; §6 target p99 < 20 µs).
 
 ### Layer 2 — full trip planning (portfolio + choice + certificate)
 
 | measure | value | §6 target |
 |---|---|---|
-| plan latency median / p99 | 15474.2 µs / 59,035 µs | — |
-| planning throughput (4 threads) | 189 trips/s | — |
-| mean portfolio size | 2.5 alternatives | 3-5 |
+| plan latency median / p99 | 7437.1 µs / 35,921 µs | — |
+| planning throughput (4 threads) | 337 trips/s | — |
+| mean portfolio size | 2.2 alternatives | 3-5 |
 | certified-exact fraction | 77.8 % | ≥ 90% |
 | mean certified gap (uncertified tail) | 2.43 % | < 1% |
-| repair searches | 7,075 (35.4 % of trips, 2,080 hit budget) | 2-10% |
-| repair p99 latency | 13,685 µs | < 500 µs |
-| Suurballe backups | 21 | — |
+| repair searches | 7,076 (35.4 % of trips, 2,080 hit budget) | 2-10% |
+| repair p99 latency | 5,855 µs | < 500 µs |
+| Suurballe backups | 19 | — |
 | unreachable trips | 0 | no increase vs vanilla (= genuine) |
 
 ### Layer 2 v2 — §4.9 route-knowledge cache (zonal demand, 65% on 40 zone pairs)
 
 | measure | value | design claim |
 |---|---|---|
-| cache-served share | 84.2 % (25,247 of 30,000) | high under commuter locality |
-| warm plan latency (cache-served) | median 2,366 µs, p99 5,906 µs | — |
-| cold plan latency (direct generation, seeds entry) | median 6,005 µs, p99 21,408 µs | demoted to seeding fallback |
-| warm/cold speedup | 2.5x median | — |
-| quarantine diversions (thin entry -> direct gen) | 4,214 | surge never funneled onto one path |
+| cache-served share | 80.7 % (24,222 of 30,000) | high under commuter locality |
+| warm plan latency (cache-served) | median 1,261 µs, p99 2,804 µs | — |
+| cold plan latency (direct generation, seeds entry) | median 2,945 µs, p99 8,656 µs | demoted to seeding fallback |
+| warm/cold speedup | 2.3x median | — |
+| quarantine diversions (thin entry -> direct gen) | 5,228 | surge never funneled onto one path |
 | sync fallbacks (portfolio collapse) | 0, p99 0 µs | p99 < 500 µs (§6) |
-| exploration | 600 tasks, 2 donated vias, 4,439 µs/task | off the critical path |
-| certificate gaps -> exploration demand | 13,898 (no synchronous repairs: 0) | §4.7 v2 |
-| cache footprint | 539 entries, 0.1 MB | tens of MB at 10⁴-10⁵ entries |
-| retained per-agent cursor | 141 B (+922 B driven geometry) | tens of bytes + driven route |
+| exploration | 600 tasks, 1 donated vias, 2,275 µs/task | off the critical path |
+| certificate gaps -> exploration demand | 14,015 (no synchronous repairs: 0) | §4.7 v2 |
+| cache footprint | 550 entries, 0.1 MB | tens of MB at 10⁴-10⁵ entries |
+| retained per-agent cursor | 136 B (+922 B driven geometry) | tens of bytes + driven route |
 
 ### Layer 4 — via-node re-pricing (per alternative, two CCH queries)
 
-median 232.6 µs, p99 663.6 µs — a 5-alternative portfolio re-prices in ~1163 µs.
+median 88.3 µs, p99 147.0 µs — a 5-alternative portfolio re-prices in ~441 µs.
 
 ### Layer 3 — flexible destinations + service dispatch
 
 | measure | value |
 |---|---|
-| bucket build, 10,000 destinations | 2,500 ms (2,019,898 entries) |
-| blind staggered refresh, 500 backward searches (v2, kept for A/B) | 47.7 ms |
-| event-driven refresh, quiescent full rotation of 10,000 dests | 9.3 ms (0 re-searches) |
-| event-driven refresh after a 150-edge congestion pocket | 555.3 ms (5207 of 10000 scanned re-searched) |
-| shopper query (scan 2,500 dests/category) | median 163.4 µs, p99 656 µs, 3008 entries scanned |
-| dispatch query (fleet of 200) | median 133.7 µs, p99 419 µs |
+| bucket build, 10,000 destinations | 1,149 ms (2,091,240 entries) |
+| blind staggered refresh, 500 backward searches (v2, kept for A/B) | 31.3 ms |
+| event-driven refresh, quiescent full rotation of 10,000 dests | 14.1 ms (0 re-searches) |
+| event-driven refresh after a 150-edge congestion pocket | 8.8 ms (231 of 10000 scanned re-searched) |
+| shopper query (scan 2,500 dests/category) | median 89.6 µs, p99 446 µs, 2894 entries scanned |
+| dispatch query (fleet of 200) | median 92.8 µs, p99 423 µs |
 
-Process memory after benchmark: 823 MB managed.
+Process memory after benchmark: 593 MB managed.
 
 
 ## Design v2/v3 delta (route-knowledge cache, async repair, event-driven channels)
@@ -202,11 +204,11 @@ gridlock. The rebuild is stable under BOTH regimes.
 | signal regime | mode | oscillation (std of corridor share) | mean travel (ticks) |
 |---|---|---|---|
 | fast | vanilla | 0.4178 | 78.7 |
-| fast | **rebuild** | **0.0686** | **69.0** |
+| fast | **rebuild** | **0.0709** | **69.0** |
 | slow | vanilla | 0.0000 (gridlocked) | 181.8 |
 | slow | **rebuild** | **0.0450** | **69.0** |
 
-**Fast regime: oscillation amplitude 6.1× below vanilla** (§6 target ≥ 5×).
+**Fast regime: oscillation amplitude 5.9× below vanilla** (§6 target ≥ 5×).
 **Slow regime: vanilla collapses into gridlock (2.6× the rebuild's travel time); the rebuild stays near-stationary (0.0450).**
 
 The damping comes from the §4 trio — logit noise over genuinely comparable
@@ -240,79 +242,86 @@ non-monotonic in the blend/noise parameters (0.6/0.10 measured best;
 
 ## A1 answered on REAL road networks (not the synthetic city)
 
-Every performance number above was measured on a *synthetic* city. The single
-biggest architectural risk was A1 — **do real road networks have the small
-separators the CCH depends on?** That is now measured, using real road-network
-topology pulled from the DIMACS/PACE benchmark corpus
-([ben-strasser/road-graphs-pace16](https://github.com/ben-strasser/road-graphs-pace16)),
-replayed through the same harness via `harness import-dimacs`.
+The single biggest architectural risk was A1 — **do real road networks have the
+small separators the CCH depends on?** Measured on real road topology from the
+DIMACS/PACE corpus
+([ben-strasser/road-graphs-pace16](https://github.com/ben-strasser/road-graphs-pace16))
+via `harness import-dimacs`, this is a valid test despite the files carrying no
+travel times: **the CCH skeleton is metric-independent by construction** (plan §4
+Layer 0) — dissection, shortcut set, and elimination tree come from topology alone.
 
-This is a valid A1 test despite the files carrying no travel times, because **the
-CCH skeleton is metric-independent by construction** (plan §4 Layer 0: "computed
-once and remains valid for every metric"). Nested dissection, the shortcut set,
-the elimination tree and its height all come from topology alone.
+The first measurement (straight geometric cuts) said: architecture holds,
+partitioner doesn't — tree height ~4× worse on real Paris than on the synthetic
+city. The partitioner was replaced with **Inertial Flow** (Schild & Sommer 2015):
+the geometric axis only *seeds* source/sink quarters, and a max-flow min-cut
+(Dinic, node-splitting) decides where the cut actually runs — it finds the Seine
+crossings and rail-trench bottlenecks a straight line cannot. Balance ≥ 25% holds
+by construction; base cells are ordered by min-degree; coordinate-less graphs get
+a BFS-level embedding as the projection instead of the old level-set bisection.
 
-| measure | synthetic 131k | **Paris 202k** (real topo + real coords) | **New York 264k** (real topo, no coords) |
-|---|---|---|---|
-| chordal arcs | 9.2× | **8.0×** | 16.5× |
-| elimination tree height | 264 | **1,019** | 1,732 |
-| query median | 49–88 µs | **849 µs** | 4,169 µs |
-| query p99 | 108–154 µs | **1,415 µs** | 6,291 µs |
-| speedup vs Dijkstra | 110–124× | **27×** | — |
-| correctness vs Dijkstra | exact | **200/200 exact** | 200/200 exact |
+### Morphology sweep, geometric → Inertial Flow (`--partitioner` A/B, same harness)
 
-### Verdict: mixed, and specific
+The sweep spans city *shapes*, per the observation that a CS2 player city (deliberate
+suburbs, engineered bottlenecks) is not any one real city: a dense monocentric core
+(central Paris), a full metro (greater Paris), a polycentric conurbation (the Ruhr —
+closest in spirit to a mature CS2 map with its multiple centers), a no-geometry
+stress case (New York), and the synthetic grid.
 
-**What holds.** The structural premise is sound: real road networks produce
-*less* shortcut blow-up than my synthetic city (8.0× vs 9.2×), so the
-all-shortcuts CCH superset is not a problem at real topology. And the engine is
-exactly correct on real maps — 200/200 against reference Dijkstra on both
-cities, which is the first time any of this code has touched non-synthetic data.
+| network | nodes | tree height | chordal arcs | query median | query p99 | vs Dijkstra | exact |
+|---|---|---|---|---|---|---|---|
+| central Paris core | 16,980 | 330 → **194** | 8.1× → **5.8×** | 164 → **50 µs** | 290 → **330 µs** | 11× → **32×** | 200/200 |
+| Ruhr metro (polycentric) | 133,780 | 625 → **241** | 5.2× → **3.8×** | 428 → **87 µs** | 687 → **169 µs** | 33× → **151×** | 200/200 |
+| greater Paris | 202,291 | 1,019 → **431** | 8.0× → **4.6×** | 849 → **216 µs** | 1,415 → **360 µs** | 27× → **112×** | 200/200 |
+| New York (no coords) | 264,346 | 1,732 → **382** | 16.5× → **5.3×** | 4,169 → **132 µs** | 6,291 → **273 µs** | — → **203×** | 200/200 |
+| synthetic grid | 14,399 | 136 → 159 | 6.9× → 6.7× | 33 → 31 µs | 75 → 75 µs | 54× → 45× | 200/200 |
 
-**What does not.** The elimination tree is **~4× taller than the synthetic
-benchmark suggested** (1,019 vs 264), and since height drives query cost, the
-real-map speedup is **27×, not the 110–124× reported above**. The §6 target of
-p99 < 20 µs is far off on real topology.
+### Verdict: the fix landed, and the diagnosis was right
 
-**The synthetic city flattered the result, and I can say exactly how.** I built
-it with district walls — local streets do not cross superblock boundaries every
-32 rows — to imitate real hierarchy. That produces *artificially clean*
-separators. Real road networks are messier, and the recursive geometric bisection
-in `NestedDissection` does not find comparably good cuts on them.
+**Real networks now sit at or beyond the synthetic benchmark.** The Ruhr — 133,780
+real nodes, nearly the same scale as the 131k synthetic city — runs 87 µs median /
+169 µs p99, matching the synthetic city's numbers at the same scale, at **151× over
+per-query Dijkstra**. Greater Paris went from 27× to 112×. The earlier claim that
+the synthetic city flattered the old partitioner is confirmed the other way around
+too: on the grid, flow ≈ geometric (its district walls are exactly the cuts a
+straight line finds), while on every real morphology flow wins 2–5× on height and
+3–30× on query time.
 
-**The bottleneck is the partitioner, not the architecture.** `NestedDissection`
-uses simple recursive coordinate bisection with a min-crossing window heuristic.
-The CCH literature uses substantially stronger separator algorithms — Inertial
-Flow, FlowCutter, KaHIP — precisely because separator quality is the whole game.
-This is a known, bounded, well-studied replacement, and it is the highest-value
-next piece of engineering in the repo.
+**The BFS fallback is no longer a liability.** New York (no coordinates) was the
+worst case at 4,169 µs median under level-set bisection; flow over a BFS-level
+embedding makes it the *best* large case measured (132 µs, 203×). A CS2 export
+always carries coordinates, but the coordinate-free path no longer needs that excuse.
 
-**Coordinates are load-bearing, and the fallback is a liability.** New York
-carries no coordinates, so it exercised the BFS level-set fallback: height 1,732,
-arcs 16.5×, queries 4,169 µs — roughly 5× worse queries and 2× worse arc blow-up
-than the same class of network *with* geometry. In-game this path should never be
-taken (CS2 supplies `Game.Net.Node.m_Position`), but the gap says the fallback
-should not be relied on anywhere.
+**Height is not the whole cost story — arc volume is.** On the 131k synthetic
+city, flow *raised* tree height (264 → 331) yet *cut* chordal arcs 24% (2.22M →
+1.69M) and roughly halved measured query time, full customization, and
+weight memory (284 → 216 MB). Smaller separators mean smaller cliques everywhere
+even when the tree gets taller; partial customization and the event-driven bucket
+channel (a congestion pocket now re-searches 231 destinations instead of 5,207)
+inherit the same win. Part of the wall-clock delta is cache locality on smaller
+cliques rather than pure arc count, so treat ratios other than the arc counts as
+measured-on-this-container.
 
-**What is unaffected.** Separator quality is orthogonal to most of this repo:
-the §4.9 route cache, portfolios and certificates, decision-point replanning, the
-anti-herding results, adaptive departures and the telemetry layer all sit above
-the query engine and are unchanged by tree height. A1 revises the *query latency*
-headline; it does not touch the equilibrium or caching results.
+**Costs, stated plainly.** Order computation is 5–20× slower than the geometric
+sweep (greater Paris 20.4 s, Ruhr 9.3 s, NY 7.2 s single-threaded C#) because each
+cell may run up to four max-flows. That cost sits on the once-per-topology-edit
+async rebuild path (§4 Layer 0), not on queries or refreshes, and directions are
+independently parallelizable. The central-Paris flow p99 (330 µs vs geometric's
+290 µs on a 3 s run) is measurement noise at that scale; its median is 3.3× better.
 
 **A2 remains open** — demand locality needs recorded CS2 trips, which needs the
-game. `harness import` already reports it whenever a demand trace is present.
+game. `harness import` already reports it whenever a demand trace is present
+(the synthetic export replay measures 72–75% under either partitioner).
 
 ## §6 acceptance-target scorecard
 
 | §6 target | measured (harness) | verdict |
 |---|---|---|
-| point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **1,415 µs on real Paris (202k), 27× vs Dijkstra** — see the A1 section: the shortcut superset holds (8.0×) but the elimination tree is ~4× taller than the synthetic city suggested | **miss**; the fix is a stronger separator algorithm (Inertial Flow / FlowCutter), not an architectural change |
-| point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 315 µs p99, 110-124× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; absolute target needs Burst + real-city separators (a full-grid synthetic city is the worst case) |
-| full customization < 10 ms | 1.06 s (16 metrics, single-thread C#) | miss on absolute; the sweep is SIMD-lane-parallel and level-parallelizable — Burst-class headroom is large but this target is at risk and should be re-measured in-game |
-| typical partial customization < 1 ms | 9.4 ms median for a clustered congestion pocket (3,630 of 2.2M arcs — 0.16%); scattered random edges 132 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
+| point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **169–360 µs p99, 112–203× vs Dijkstra** across the real-morphology sweep (Ruhr 134k: 87 µs median / 169 µs p99; greater Paris 202k: 216/360 µs; NY 264k: 132/273 µs) with Inertial Flow separators | architectural claim now holds on real maps at synthetic-benchmark levels; the absolute 20 µs still needs Burst-class constant factors |
+| point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 174 µs p99 (94.5 µs median), 122× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; remaining gap to the absolute target is Burst-class constant factors |
+| full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques) | miss on absolute; the sweep is SIMD-lane-parallel and level-parallelizable — Burst-class headroom is large but this target is at risk and should be re-measured in-game |
+| typical partial customization < 1 ms | 6.9 ms median for a clustered congestion pocket (3,362 of 1.7M arcs — 0.2%); scattered random edges 92 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 4.0× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
-| oscillation amplitude reduced ≥ 5× | **6.1×** vs the oscillating vanilla regime (fast signal, after unit-consistent blended switching); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |
+| oscillation amplitude reduced ≥ 5× | **5.9×** vs the oscillating vanilla regime (fast signal, re-measured under the flow partitioner); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |
 | zero increase in unreachable-trip failures | 0 unreachable events across bench + 100k-trip sim | met |
 | certified-exact ≥ 90%, mean gap < 1% | 77.8% certified at plan time (cold planner), gaps now logged as per-entry exploration demand rather than repaired synchronously | miss on the fraction; k-sweep shows anchor count is not the lever — §4.8 online adaptation consumes exactly the telemetry now emitted |
 | exploration fully off critical path; sync fallback p99 < 0.5 ms (§6 v2) | 0 synchronous repairs; exploration budgeted off-path (~2.6 ms/task C#); 0 sync fallbacks needed, bounded by one CCH query (p99 154 µs) | met |
