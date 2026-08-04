@@ -4,17 +4,17 @@
 
 | measure | value |
 |---|---|
-| wall time | 2,133 s (2.8x realtime) |
-| arrivals | 91,731 / 100,000 |
-| trips planned (incl. regenerations) | 108,235 |
-| certified-exact fraction | 76.9 % |
-| planning time | 1509.9 s total, 13,950 µs/trip |
-| movement | 14.41 ms/tick |
-| live-metric partial customization | 898.62 ms/refresh |
-| Layer-4 wakes + re-pricing | 1097.75 ms/refresh |
-| re-prices / probes / regenerations | 719,318 / 43,117 / 8,235 |
-| route switches (past hysteresis) | 54,747 |
-| event wakes (metered) / region wakes / sweeper | 0 / 1,116 / 2 |
+| wall time | 1,938 s (3.1x realtime) |
+| arrivals | 99,975 / 100,000 |
+| trips planned (incl. regenerations) | 100,000 |
+| certified-exact fraction | 55.7 % |
+| planning time | 723.8 s total, 7,238 µs/trip |
+| movement | 11.84 ms/tick |
+| live-metric partial customization | 3156.58 ms/refresh |
+| Layer-4 wakes + re-pricing | 821.45 ms/refresh |
+| re-prices / probes / regenerations | 1,250,600 / 0 / 0 |
+| route switches (past hysteresis) | 1,631 |
+| event wakes (metered) / region wakes / sweeper | 0 / 2,902 / 601 |
 | soft-closed edges at end | 0 |
 | unreachable-trip events | 0 |
 
