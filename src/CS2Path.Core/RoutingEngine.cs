@@ -52,11 +52,26 @@ namespace CS2Path.Core
         }
 
         /// <summary>Refresh the live-scenario lanes after a traffic update.
-        /// Millisecond-scale partial customization (plan §4 Layer 1).</summary>
+        /// Millisecond-scale partial customization (plan §4 Layer 1).
+        /// Single-writer contract: no queries may run concurrently with a
+        /// refresh — in-game this is a sync point between the customization job
+        /// and the query jobs, in the harness the tick loop serializes them.</summary>
         public void RefreshLive(List<int> changedEdges)
         {
             int start = Anchors.ScenarioBlockStart(Scenario.Live);
             Metrics.PartialCustomize(changedEdges, start, Anchors.ProfileCount);
+        }
+
+        /// <summary>Refresh ALL lane blocks for closure-state transitions. Hard
+        /// closures (+inf) define the edge weight in EVERY scenario, so a
+        /// close/reopen must recustomize free-flow and typical lanes too —
+        /// otherwise those lanes desync from their own metric definition until
+        /// the next structural rebuild. Closure transitions are rare; the extra
+        /// lanes are cheap.</summary>
+        public void RefreshClosures(List<int> changedEdges)
+        {
+            if (changedEdges.Count > 0)
+                Metrics.PartialCustomize(changedEdges, 0, Anchors.MetricCount);
         }
 
         /// <summary>Structural edit: kick off a background rebuild; queries keep

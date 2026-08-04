@@ -148,8 +148,17 @@ namespace CS2Path.Core
                 var lam = new[] { (nearK, 1f) };
                 for (int it = 0; it < Cfg.PenaltyIters && vias.Count < Cfg.MaxAlternatives; it++)
                 {
+                    // multiplicative penalty plus a small additive term so the
+                    // penalty still bites on zero-weight edges (e.g. toll-free
+                    // edges under a money-dominated anchor); weight stays >= the
+                    // base metric, keeping the potential admissible
                     float d = _astar.Search(_ctx, s, t, lam,
-                        e => _anchors.EdgeWeight(_g, e, nearK) * (_penalty.TryGetValue(e, out var mu) ? mu : 1f),
+                        e =>
+                        {
+                            float baseW = _anchors.EdgeWeight(_g, e, nearK);
+                            if (!_penalty.TryGetValue(e, out var mu)) return baseW;
+                            return baseW * mu + (mu - 1f) * 0.001f * _g.TimeFree[e];
+                        },
                         _pathBuf2, Cfg.PenaltyMaxSettled);
                     Stats.PenaltySearches++;
                     Stats.PenaltySettled += _astar.LastSettledCount;
@@ -166,14 +175,20 @@ namespace CS2Path.Core
             {
                 if (Suurballe.FindDisjointPair(_g, s, t, e => _anchors.EdgeWeight(_g, e, nearK), _sbP1, _sbP2))
                 {
+                    // the disjoint pair comes back in arbitrary order — adopt
+                    // whichever walk contributes a NEW via node
                     int via = RankMaxNode(_sbP2);
-                    if (via >= 0 && viaSet.Add(via)) vias.Add((via, true));
-                    Stats.DisjointBackups++;
+                    if (!(via >= 0 && viaSet.Add(via))) via = RankMaxNode(_sbP1);
+                    if (via >= 0 && viaSet.Add(via))
+                    {
+                        vias.Add((via, true));
+                        Stats.DisjointBackups++;
+                    }
                 }
             }
 
             // --- 4. Admissibility filter + exact true-alpha scoring ---
-            BuildScoredAlternatives(plan, s, t, nearK, vias);
+            BuildScoredAlternatives(plan, s, t, nearK, dNear, vias);
             if (plan.Alts.Count == 0) { plan.Unreachable = true; Stats.UnreachableTrips++; return plan; }
 
             // --- 5. Certificate, repair, logit choice ---
@@ -184,27 +199,32 @@ namespace CS2Path.Core
         }
 
         /// <summary>Score candidate vias exactly under alpha; enforce stretch,
-        /// overlap and the ε-envelope; write plan.Alts (best alpha first).</summary>
-        private void BuildScoredAlternatives(TripPlan plan, int s, int t, int nearK, List<(int via, bool backup)> vias)
+        /// overlap and the ε-envelope; write plan.Alts (best alpha first).
+        /// bestNearSeed is the exact nearest-anchor optimum (dNear): seeding the
+        /// stretch bound with it keeps candidate order from loosening the filter.</summary>
+        private void BuildScoredAlternatives(TripPlan plan, int s, int t, int nearK, float bestNearSeed, List<(int via, bool backup)> vias)
         {
             var alpha = plan.Alpha;
-            float bestNear = float.PositiveInfinity;
+            float bestNear = bestNearSeed;
             var scored = new List<(Alternative alt, List<int> edges, float refTime)>(vias.Count);
+            var leg1Arcs = new List<(int arc, bool fwd)>(64);
 
             foreach (var (via, backup) in vias)
             {
-                float d1 = _q.Distance(_ctx, s, via, nearK);
-                float d2 = _q.Distance(_ctx, via, t, nearK);
+                // one arc-path query per leg; geometry unpacked only for survivors
+                float d1 = _q.DistanceWithArcPath(_ctx, s, via, nearK);
+                if (float.IsPositiveInfinity(d1)) continue;
+                leg1Arcs.Clear();
+                leg1Arcs.AddRange(_ctx.ArcPath);
+                float d2 = _q.DistanceWithArcPath(_ctx, via, t, nearK);
                 float costNear = d1 + d2;
                 if (float.IsPositiveInfinity(costNear)) continue;
                 if (costNear < bestNear) bestNear = costNear;
                 if (!backup && costNear > bestNear * Cfg.StretchMax) continue;
 
                 var edges = new List<int>(256);
-                _q.DistanceWithPath(_ctx, s, via, nearK, _pathBuf);
-                edges.AddRange(_pathBuf);
-                _q.DistanceWithPath(_ctx, via, t, nearK, _pathBuf);
-                edges.AddRange(_pathBuf);
+                foreach (var (arc, fwd) in leg1Arcs) _q.UnpackArc(_ctx.UnpackStack, arc, fwd, nearK, edges);
+                foreach (var (arc, fwd) in _ctx.ArcPath) _q.UnpackArc(_ctx.UnpackStack, arc, fwd, nearK, edges);
 
                 float alphaCost = 0f, refTime = 0f;
                 foreach (var e in edges)
@@ -299,11 +319,15 @@ namespace CS2Path.Core
                 if (d < plan.BestAlphaCost * (1f - 1e-6f) && RankMaxNode(_pathBuf2) >= 0)
                 {
                     // Self-correcting portfolio (§4.8): adopt the repaired route.
+                    // Give it a real anchor cost — NaN would poison Layer-4
+                    // re-pricing comparisons downstream.
                     int via = RankMaxNode(_pathBuf2);
+                    int nearK2 = LiveMetric(plan.NearestProfile);
+                    float anchorCost = _q.Distance(_ctx, s, via, nearK2) + _q.Distance(_ctx, via, t, nearK2);
                     plan.Alts.Insert(0, new Alternative
                     {
                         ViaNode = via, Destination = t,
-                        AnchorCost = float.NaN, AlphaCost = d,
+                        AnchorCost = anchorCost, AlphaCost = d,
                     });
                     _acceptedGeomsScratch.Insert(0, new List<int>(_pathBuf2));
                     plan.BestAlphaCost = d;
@@ -359,6 +383,24 @@ namespace CS2Path.Core
 
         public float ProbeDirect(int fromNode, int dest, int profile)
             => _q.Distance(_ctx, fromNode, dest, LiveMetric(profile));
+
+        /// <summary>True remaining cost of the CURRENT plan: sum of live anchor
+        /// weights along the not-yet-driven path. Used by Layer 4 instead of the
+        /// via re-price once the agent may have passed its via node — pricing
+        /// cur->via->dest for a consumed via would inflate the incumbent and
+        /// make switches trigger-happy.</summary>
+        public float RemainingPathCost(List<int> path, int cursor, int profile)
+        {
+            int k = LiveMetric(profile);
+            float sum = 0f;
+            for (int i = cursor; i < path.Count; i++)
+            {
+                float w = _anchors.EdgeWeight(_g, path[i], k);
+                if (float.IsPositiveInfinity(w)) return float.PositiveInfinity;
+                sum += w;
+            }
+            return sum;
+        }
 
         private int RankMaxNode(List<int> edgePath)
         {

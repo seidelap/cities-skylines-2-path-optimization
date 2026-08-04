@@ -156,21 +156,40 @@ namespace CS2Path.Harness
             var g = city.G;
             var rng = new SplitMix64(seed);
             var det = new SoftClosureDetector(g);
-            var changed = new List<int>();
-            for (int i = 0; i < 30; i++) det.SetHardClosed(rng.NextInt(g.EdgeCount), true, changed);
-            eng.RefreshLive(changed);
             var ctx = eng.Query.CreateContext();
-            int bad = 0;
-            int liveStart = eng.Anchors.ScenarioBlockStart(Scenario.Live);
-            for (int i = 0; i < 300; i++)
+
+            int CompareAllMetrics(SplitMix64 r, int rounds)
             {
-                int s = rng.NextInt(g.NodeCount), t = rng.NextInt(g.NodeCount);
-                int k = liveStart + rng.NextInt(eng.Anchors.ProfileCount);
-                float dc = eng.Query.Distance(ctx, s, t, k);
-                float dr = Reference.Dijkstra(g, s, t, MetricWeight(g, eng.Anchors, k));
-                if (!Close(dc, dr)) bad++;
+                int bad = 0;
+                for (int i = 0; i < rounds; i++)
+                {
+                    int s = r.NextInt(g.NodeCount), t = r.NextInt(g.NodeCount);
+                    // hard closures define the weight in EVERY scenario, so
+                    // every lane block must agree with the reference
+                    int k = r.NextInt(eng.Anchors.MetricCount);
+                    float dc = eng.Query.Distance(ctx, s, t, k);
+                    float dr = Reference.Dijkstra(g, s, t, MetricWeight(g, eng.Anchors, k));
+                    if (!Close(dc, dr)) bad++;
+                }
+                return bad;
             }
-            Check(bad == 0, $"hard-closure routing: {bad} mismatches");
+
+            var changed = new List<int>();
+            var closedEdges = new List<int>();
+            for (int i = 0; i < 30; i++)
+            {
+                int e = rng.NextInt(g.EdgeCount);
+                det.SetHardClosed(e, true, changed);
+                closedEdges.Add(e);
+            }
+            eng.RefreshClosures(changed);
+            Check(CompareAllMetrics(rng, 300) == 0, "hard-closure routing mismatches (all scenarios)");
+
+            // reopen round-trip: non-live lanes must recover too
+            changed.Clear();
+            foreach (var e in closedEdges) det.SetHardClosed(e, false, changed);
+            eng.RefreshClosures(changed);
+            Check(CompareAllMetrics(rng, 300) == 0, "reopen round-trip mismatches (all scenarios)");
         }
 
         private static void VerifyPaths(ulong seed)

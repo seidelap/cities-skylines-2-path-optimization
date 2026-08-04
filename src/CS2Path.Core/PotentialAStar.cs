@@ -69,6 +69,14 @@ namespace CS2Path.Core
             edgePathOut.Clear();
             int L = lambda.Length;
             if (L > MaxLanes) throw new ArgumentException($"at most {MaxLanes} potential lanes");
+            if (_stamp >= int.MaxValue - 1)
+            {
+                Array.Clear(_potStamp, 0, _potStamp.Length);
+                Array.Clear(_bStamp, 0, _bStamp.Length);
+                Array.Clear(_gStamp, 0, _gStamp.Length);
+                Array.Clear(_settledStamp, 0, _settledStamp.Length);
+                _stamp = 0;
+            }
             _stamp++;
             int stamp = _stamp;
 

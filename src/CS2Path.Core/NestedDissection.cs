@@ -44,9 +44,9 @@ namespace CS2Path.Core
                 for (int i = 0; i < count; i++) inSet[set[i]] = stamp;
 
                 // --- Partition into A / B ---
+                float minX = float.MaxValue, maxX = float.MinValue, minY = float.MaxValue, maxY = float.MinValue;
                 if (g.X != null && g.Y != null)
                 {
-                    float minX = float.MaxValue, maxX = float.MinValue, minY = float.MaxValue, maxY = float.MinValue;
                     for (int i = 0; i < count; i++)
                     {
                         int v = set[i];
@@ -55,6 +55,9 @@ namespace CS2Path.Core
                         if (g.Y[v] < minY) minY = g.Y[v];
                         if (g.Y[v] > maxY) maxY = g.Y[v];
                     }
+                }
+                if (g.X != null && g.Y != null && ((maxX - minX) > 0f || (maxY - minY) > 0f))
+                {
                     bool splitX = (maxX - minX) >= (maxY - minY);
                     var keys = new float[count];
                     for (int i = 0; i < count; i++) keys[i] = splitX ? g.X![set[i]] : g.Y![set[i]];

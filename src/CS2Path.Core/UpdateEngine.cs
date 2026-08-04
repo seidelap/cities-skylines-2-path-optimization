@@ -56,9 +56,10 @@ namespace CS2Path.Core
         // region -> agents with a portfolio via-node there.
         private readonly List<(int agent, int version)>?[] _viaRegionIndex;
 
+        // Single FIFO wake queue with a dedupe set: budget overflow carries to
+        // the next tick and is served oldest-first (no starvation of backlog).
         private readonly HashSet<int> _wakeSet = new HashSet<int>();
-        private readonly List<int> _wakeList = new List<int>();
-        private readonly Queue<int> _deferredWakes = new Queue<int>();
+        private readonly Queue<int> _wakeQueue = new Queue<int>();
         private readonly Dictionary<int, Queue<int>> _closureQueues = new Dictionary<int, Queue<int>>();
         private readonly float[] _regionImprovement;
         private int _sweepCursor;
@@ -140,13 +141,14 @@ namespace CS2Path.Core
         }
 
         /// <summary>Channel 2b: blind hash-staggered sweeper — the safety net for
-        /// improvements in no one's portfolio. Rate is a small fraction per tick,
-        /// i.e. every agent reconsidered within a few sim-minutes.</summary>
-        public void Sweep(IReadOnlyList<ActiveTrip> trips)
+        /// improvements in no one's portfolio. Rate is a small fraction per tick;
+        /// pass the tick cadence when calling less than once per tick so the
+        /// sim-time coverage period stays what the config says.</summary>
+        public void Sweep(IReadOnlyList<ActiveTrip> trips, int cadenceTicks = 1)
         {
             int n = trips.Count;
             if (n == 0) return;
-            int count = Math.Max(1, (int)(n * Cfg.SweepFraction));
+            int count = Math.Max(1, (int)(n * Cfg.SweepFraction * cadenceTicks));
             for (int i = 0; i < count; i++)
             {
                 _sweepCursor = (_sweepCursor + 1) % n;
@@ -165,18 +167,22 @@ namespace CS2Path.Core
             var list = _edgeIndex[edge];
             if (list == null) return;
             var upstream = new List<(int agent, int hops)>();
-            foreach (var (agent, ver) in list)
+            int w = 0;
+            for (int i = 0; i < list.Count; i++)
             {
+                var (agent, ver) = list[i];
                 var t = trips[agent];
                 if (t.Finished || t.RouteVersion != ver) continue;
+                list[w++] = list[i]; // compact stale entries while we're here
                 int hops = -1;
                 var path = t.Plan.ChosenEdgePath;
-                for (int i = t.PathCursor; i < path.Count && i < t.PathCursor + 4096; i++)
-                    if (path[i] == edge) { hops = i - t.PathCursor; break; }
+                for (int j = t.PathCursor; j < path.Count && j < t.PathCursor + 4096; j++)
+                    if (path[j] == edge) { hops = j - t.PathCursor; break; }
                 if (hops < 0) continue;
                 if (hops <= Cfg.QueuedHops) continue; // boxed in: waiting IS the plan
                 upstream.Add((agent, hops));
             }
+            list.RemoveRange(w, list.Count - w);
             upstream.Sort((a, b) => b.hops.CompareTo(a.hops)); // farthest first
             var q = new Queue<int>();
             foreach (var (agent, _) in upstream) q.Enqueue(agent);
@@ -200,57 +206,55 @@ namespace CS2Path.Core
         private bool Wake(int agent)
         {
             if (!_wakeSet.Add(agent)) return false;
-            if (_wakeList.Count < Cfg.MaxWakesPerTick) _wakeList.Add(agent);
-            else _deferredWakes.Enqueue(agent);
+            _wakeQueue.Enqueue(agent);
             return true;
         }
 
-        /// <summary>Tiered refresh of every woken agent. Returns number refreshed.
-        /// switchExpand re-expands geometry + re-registers when a switch happens.</summary>
+        /// <summary>Tiered refresh of woken agents, oldest wake first, bounded by
+        /// MaxWakesPerTick. Returns number refreshed.</summary>
         public int ProcessWakes(IReadOnlyList<ActiveTrip> trips, Action<int, int> onSwitched, Func<int, bool> onRegenerate)
         {
-            // top up from deferred backlog
-            while (_wakeList.Count < Cfg.MaxWakesPerTick && _deferredWakes.Count > 0)
-            {
-                int a = _deferredWakes.Dequeue();
-                if (_wakeSet.Contains(a)) _wakeList.Add(a);
-            }
             int processed = 0;
-            foreach (var agent in _wakeList)
+            int budget = Cfg.MaxWakesPerTick;
+            while (budget-- > 0 && _wakeQueue.Count > 0)
             {
-                var t = trips[agent];
+                int agent = _wakeQueue.Dequeue();
                 _wakeSet.Remove(agent);
+                var t = trips[agent];
                 if (t.Finished || !t.Plan.HasPlan) continue;
                 processed++;
                 RefreshAgent(agent, t, onSwitched, onRegenerate);
             }
-            _wakeList.Clear();
-            // carry any remaining deferred wakes into next tick's list lazily
             return processed;
         }
 
         private void RefreshAgent(int agent, ActiveTrip t, Action<int, int> onSwitched, Func<int, bool> onRegenerate)
         {
             var plan = t.Plan;
+            if (plan.Alts.Count == 0) return;
             int profile = plan.NearestProfile;
             int cur = t.CurrentNode;
 
-            // Tier 1: re-price the portfolio — O(k) via-node re-pricing.
+            // Incumbent price: the true remaining cost of the path being driven.
+            // (Re-pricing the chosen alternative as cur->via->dest would inflate
+            // it once the agent has passed its via node.)
+            float curCost = _planner.RemainingPathCost(plan.ChosenEdgePath, t.PathCursor, profile);
+
+            // Tier 1: re-price the rest of the portfolio — O(k) via re-pricing.
             int bestIdx = -1; float bestCost = float.PositiveInfinity;
-            float curCost = float.PositiveInfinity;
             for (int i = 0; i < plan.Alts.Count; i++)
             {
+                if (i == plan.ChosenIdx) continue;
                 float c = _planner.RepriceAlternative(cur, plan.Alts[i], profile);
                 Stats.Reprices++;
-                if (i == plan.ChosenIdx) curCost = c;
                 if (c < bestCost) { bestCost = c; bestIdx = i; }
             }
-            if (bestIdx < 0) return;
 
-            bool wholePortfolioDegraded = bestCost > t.LastRemainingCost * Cfg.ProbeDegradeFactor && t.LastRemainingCost > 0;
+            float incumbent = Math.Min(curCost, bestCost);
+            bool wholePortfolioDegraded = incumbent > t.LastRemainingCost * Cfg.ProbeDegradeFactor && t.LastRemainingCost > 0;
 
             // Tier 1 outcome: switch only past the hysteresis margin.
-            if (bestIdx != plan.ChosenIdx && bestCost < curCost * (1 - Cfg.Hysteresis))
+            if (bestIdx >= 0 && bestCost < curCost * (1 - Cfg.Hysteresis))
             {
                 plan.ChosenIdx = bestIdx;
                 plan.ChosenAlphaCost = plan.Alts[bestIdx].AlphaCost;
@@ -260,21 +264,23 @@ namespace CS2Path.Core
                 return;
             }
 
-            // Tier 2: one probe query against the agent's nearest anchor.
-            if (wholePortfolioDegraded || float.IsPositiveInfinity(bestCost))
+            // Tier 2: one probe query against the agent's nearest anchor. Also
+            // taken when the whole portfolio (including the driven path) has
+            // gone infinite — e.g. a closure severed every alternative.
+            if (wholePortfolioDegraded || float.IsPositiveInfinity(incumbent))
             {
                 float probe = _planner.ProbeDirect(cur, plan.Destination, profile);
                 Stats.Probes++;
                 // Tier 3: full regeneration only if the probe beats the whole
                 // portfolio by the hysteresis margin.
-                if (probe < bestCost * (1 - Cfg.Hysteresis))
+                if (probe < incumbent * (1 - Cfg.Hysteresis))
                 {
                     Stats.Regenerations++;
                     onRegenerate(agent);
                     return;
                 }
             }
-            t.LastRemainingCost = bestCost;
+            t.LastRemainingCost = incumbent;
         }
     }
 }

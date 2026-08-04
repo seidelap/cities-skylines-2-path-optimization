@@ -12,6 +12,7 @@ namespace CS2Path.Core
         internal int Stamp;
         internal int[] Chain = null!, ChainT = null!;
         internal List<(int arc, bool fwd)> ArcPath = new List<(int, bool)>(256);
+        internal Stack<CchQuery.UnpackFrame> UnpackStack = new Stack<CchQuery.UnpackFrame>(64);
         public int LastMeetNode = -1;
         // lazily allocated lane-batched labels (portfolio anchor sweeps)
         internal float[]? MultiDf, MultiDb;
@@ -51,13 +52,25 @@ namespace CS2Path.Core
 
         public QueryContext CreateContext() => QueryContext.Create(C.NodeCount);
 
+        /// <summary>Advance the query stamp, clearing stamp arrays on wraparound
+        /// (reachable in a long game session: ~2^31 queries).</summary>
+        private static int BumpStamp(QueryContext ctx)
+        {
+            if (ctx.Stamp >= int.MaxValue - 1)
+            {
+                Array.Clear(ctx.StampF, 0, ctx.StampF.Length);
+                Array.Clear(ctx.StampB, 0, ctx.StampB.Length);
+                ctx.Stamp = 0;
+            }
+            return ++ctx.Stamp;
+        }
+
         /// <summary>Distance s->t under metric k; meet node in ctx.LastMeetNode.</summary>
         public float Distance(QueryContext ctx, int s, int t, int k)
         {
             if (s == t) { ctx.LastMeetNode = s; return 0f; }
             var c = C;
-            ctx.Stamp++;
-            int stamp = ctx.Stamp;
+            int stamp = BumpStamp(ctx);
             int lenS = 0, lenT = 0;
             for (int v2 = s; v2 >= 0; v2 = c.EtParent[v2]) ctx.Chain[lenS++] = v2;
             for (int v2 = t; v2 >= 0; v2 = c.EtParent[v2]) ctx.ChainT[lenT++] = v2;
@@ -139,8 +152,7 @@ namespace CS2Path.Core
             ctx.MultiDf ??= new float[n * MaxBatch];
             ctx.MultiDb ??= new float[n * MaxBatch];
             var mdf = ctx.MultiDf; var mdb = ctx.MultiDb;
-            ctx.Stamp++;
-            int stamp = ctx.Stamp;
+            int stamp = BumpStamp(ctx);
             int lenS = 0, lenT = 0;
             for (int v2 = s; v2 >= 0; v2 = c.EtParent[v2]) ctx.Chain[lenS++] = v2;
             for (int v2 = t; v2 >= 0; v2 = c.EtParent[v2]) ctx.ChainT[lenT++] = v2;
@@ -256,19 +268,25 @@ namespace CS2Path.Core
             edgePathOut.Clear();
             if (float.IsPositiveInfinity(d)) return d;
             foreach (var (arc, fwd) in ctx.ArcPath)
-                UnpackArc(arc, fwd, k, edgePathOut);
+                UnpackArc(ctx.UnpackStack, arc, fwd, k, edgePathOut);
             return d;
         }
 
-        private struct UnpackFrame { public int Arc; public bool Fwd; }
+        internal struct UnpackFrame { public int Arc; public bool Fwd; }
 
         /// <summary>Expand one chordal arc into original edges, in travel order.
         /// The realizing lower triangle is metric-dependent, so unpacking takes
-        /// the metric; geometry is expanded only for routes actually driven.</summary>
+        /// the metric; geometry is expanded only for routes actually driven.
+        /// Requires the graph's live components to be in sync with the last
+        /// customization — mutating Graph.TimeLive without a RefreshLive breaks
+        /// realization matching (loudly: unpack throws).</summary>
         public void UnpackArc(int arc, bool fwd, int k, List<int> edgesOut)
+            => UnpackArc(new Stack<UnpackFrame>(8), arc, fwd, k, edgesOut);
+
+        internal void UnpackArc(Stack<UnpackFrame> stack, int arc, bool fwd, int k, List<int> edgesOut)
         {
             var c = C; var g = c.G;
-            var stack = new Stack<UnpackFrame>(8);
+            stack.Clear();
             stack.Push(new UnpackFrame { Arc = arc, Fwd = fwd });
             while (stack.Count > 0)
             {
@@ -335,8 +353,7 @@ namespace CS2Path.Core
         public void ForwardUpwardLabels(QueryContext ctx, int s, int k, Action<int, float> sink)
         {
             var c = C; var w = M.WFwd;
-            ctx.Stamp++;
-            int stamp = ctx.Stamp;
+            int stamp = BumpStamp(ctx);
             ctx.Df[s] = 0f; ctx.StampF[s] = stamp;
             int v = s;
             while (v >= 0)
@@ -364,8 +381,7 @@ namespace CS2Path.Core
         public void BackwardUpwardLabels(QueryContext ctx, int t, int k, Action<int, float> sink)
         {
             var c = C; var w = M.WBwd;
-            ctx.Stamp++;
-            int stamp = ctx.Stamp;
+            int stamp = BumpStamp(ctx);
             ctx.Db[t] = 0f; ctx.StampB[t] = stamp;
             int v = t;
             while (v >= 0)

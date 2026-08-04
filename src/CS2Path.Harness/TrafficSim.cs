@@ -57,6 +57,7 @@ namespace CS2Path.Harness
         public double MsPlanning, MsMovement, MsRefresh, MsCustomize, MsWakes;
 
         private int _scheduleCursor;
+        private float[]? _lastNotifiedMult;
         private readonly List<int> _changedEdges = new List<int>();
         private readonly List<(int, float, float)> _changedTriples = new List<(int, float, float)>();
         private readonly List<int> _closureChanged = new List<int>();
@@ -99,7 +100,7 @@ namespace CS2Path.Harness
                 sw.Restart(); Movement(); MsMovement += sw.Elapsed.TotalMilliseconds;
                 if (Mode == SimMode.Rebuild && Tick % RefreshInterval == 0) RefreshRebuild();
                 if (Mode == SimMode.Vanilla && Tick % SnapshotInterval == 0)
-                    Array.Copy(LiveEst, Snapshot, LiveEst.Length);
+                    for (int e = 0; e < G.EdgeCount; e++) Snapshot[e] = LiveEstimate(e);
                 perTick?.Invoke(Tick);
             }
         }
@@ -156,11 +157,12 @@ namespace CS2Path.Harness
 
                 if (t.CurEdge < 0)
                 {
-                    // waiting to enter first edge
+                    // waiting to enter first edge — the wait-timer applies here
+                    // too, or origin-blocked vanilla agents can never replan
                     if (t.PathCursor >= path.Count) { Finish(a, t); continue; }
                     int e0 = path[t.PathCursor];
                     if (Occ[e0] < JamCap[e0]) Enter(a, t, e0);
-                    else t.QueuedTicks++;
+                    else { t.QueuedTicks++; MaybeVanillaWaitReplan(a, t); }
                     continue;
                 }
 
@@ -208,6 +210,18 @@ namespace CS2Path.Harness
             LiveEst[e] = 0.85f * LiveEst[e] + 0.15f * measured;
         }
 
+        /// <summary>Current live-time estimate for an edge: the exit-measured EMA
+        /// blended with a queue-drain bound (freeflow + occupancy/serviceRate).
+        /// Exit measurements alone go blind under gridlock — nothing exits, so
+        /// the signal never learns and a jammed corridor keeps attracting demand.
+        /// Real traffic telemetry sees queue state; both routing modes get this
+        /// same estimator.</summary>
+        public float LiveEstimate(int e)
+        {
+            float drain = G.TimeFree[e] + Occ[e] / Math.Max(0.5f, G.Capacity[e]) * Dt;
+            return Math.Max(LiveEst[e], drain);
+        }
+
         private void Finish(int agent, ActiveTrip t)
         {
             t.Finished = true;
@@ -242,7 +256,7 @@ namespace CS2Path.Harness
             // live estimate -> TimeLive for materially changed edges
             for (int e = 0; e < g.EdgeCount; e++)
             {
-                float old = g.TimeLive[e], now = LiveEst[e];
+                float old = g.TimeLive[e], now = LiveEstimate(e);
                 if (Math.Abs(now - old) > LiveChangeThreshold * old)
                 {
                     g.TimeLive[e] = now;
@@ -252,32 +266,45 @@ namespace CS2Path.Harness
             }
 
             // Layer-1 soft-closure state machines (uses the refresh window's outflow)
-            var newlySoft = new List<int>();
+            var closureNotify = new List<int>();
             if (Detector != null)
             {
                 var serviceRate = g.Capacity;
                 var outflowAvg = OutflowWindow;
                 for (int e = 0; e < outflowAvg.Length; e++) outflowAvg[e] /= RefreshInterval;
                 Detector.Tick(Occ, outflowAvg, JamCap, serviceRate, _closureChanged);
+                // notify Layer 4 on soft-closure onset AND on each doubling of the
+                // multiplier while the jam persists (post-onset registrants and
+                // sustained escalation both need wakes)
+                if (_lastNotifiedMult == null || _lastNotifiedMult.Length < g.EdgeCount)
+                    _lastNotifiedMult = new float[g.EdgeCount];
                 foreach (var e in _closureChanged)
-                    if (Detector.IsSoftClosed(e) && g.ClosureMult[e] <= Detector.MultStart * 1.001f)
-                        newlySoft.Add(e);
+                {
+                    float m = g.ClosureMult[e];
+                    if (m <= 1.001f) { _lastNotifiedMult[e] = 0f; continue; }
+                    if (_lastNotifiedMult[e] <= 0f || m >= 2f * _lastNotifiedMult[e])
+                    {
+                        closureNotify.Add(e);
+                        _lastNotifiedMult[e] = m;
+                    }
+                }
                 Array.Clear(OutflowWindow, 0, OutflowWindow.Length);
             }
             MsRefresh += sw.Elapsed.TotalMilliseconds;
 
-            // partial customization of the live lanes
+            // partial customization: live lanes for traffic deltas, ALL lanes for
+            // closure-state transitions (hard closures define every scenario)
             sw.Restart();
-            foreach (var e in _closureChanged) _changedEdges.Add(e);
             if (_changedEdges.Count > 0) Eng!.RefreshLive(_changedEdges);
+            if (_closureChanged.Count > 0) Eng!.RefreshClosures(_closureChanged);
             MsCustomize += sw.Elapsed.TotalMilliseconds;
 
             // Layer-4 channels
             sw.Restart();
             if (_changedTriples.Count > 0) Upd!.OnTrafficRefresh(_changedTriples, Trips);
-            foreach (var e in newlySoft) Upd!.OnClosure(e, Trips);
+            foreach (var e in closureNotify) Upd!.OnClosure(e, Trips);
             Upd!.DrainClosureQueues();
-            Upd.Sweep(Trips);
+            Upd.Sweep(Trips, RefreshInterval);
             Upd.ProcessWakes(Trips, OnSwitched, OnRegenerate);
             MsWakes += sw.Elapsed.TotalMilliseconds;
         }

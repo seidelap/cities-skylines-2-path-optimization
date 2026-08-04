@@ -31,7 +31,12 @@ namespace CS2Path.Core
         }
 
         /// <summary>First metric index of a scenario's contiguous lane block.</summary>
-        public int ScenarioBlockStart(Scenario s) => Array.IndexOf(Scenarios, s) * Profiles.Length;
+        public int ScenarioBlockStart(Scenario s)
+        {
+            int si = Array.IndexOf(Scenarios, s);
+            if (si < 0) throw new ArgumentException($"scenario {s} not in grid");
+            return si * Profiles.Length;
+        }
 
         public static AnchorGrid Build(IReadOnlyList<Preference> populationSample, IReadOnlyList<float>? tripWeights,
                                        int profileCount, Scenario[] scenarios, ulong seed = 12345)
@@ -105,7 +110,12 @@ namespace CS2Path.Core
             {
                 case Scenario.FreeFlow: return pref.Dot(g.TimeFree[edge], g.Money[edge], g.Comfort[edge]);
                 case Scenario.Typical: return pref.Dot(g.TimeTypical[edge], g.Money[edge], g.Comfort[edge]);
-                default: return pref.Dot(g.TimeLive[edge], g.Money[edge], g.Comfort[edge]) * mult;
+                default:
+                    float tl = g.TimeLive[edge];
+                    // a non-finite live time from a metric feed means impassable —
+                    // never let it reach the Dot (0 * inf = NaN poisons customization)
+                    if (!float.IsFinite(tl)) return float.PositiveInfinity;
+                    return pref.Dot(tl, g.Money[edge], g.Comfort[edge]) * mult;
             }
         }
 
@@ -116,7 +126,9 @@ namespace CS2Path.Core
         {
             float mult = g.ClosureMult[edge];
             if (float.IsPositiveInfinity(mult)) return float.PositiveInfinity;
-            return alpha.Dot(g.TimeLive[edge], g.Money[edge], g.Comfort[edge]) * mult;
+            float tl = g.TimeLive[edge];
+            if (!float.IsFinite(tl)) return float.PositiveInfinity;
+            return alpha.Dot(tl, g.Money[edge], g.Comfort[edge]) * mult;
         }
 
         /// <summary>Nearest live-scenario anchor profile for alpha (direction distance).</summary>

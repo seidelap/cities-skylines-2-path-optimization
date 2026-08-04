@@ -46,7 +46,10 @@ namespace CS2Path.Core
             var g = _g;
             for (int e = 0; e < g.EdgeCount; e++)
             {
-                if (float.IsPositiveInfinity(g.ClosureMult[e])) continue; // hard closed: owned by WorldEvents
+                // hard closed (owned by WorldEvents): skip only when the detector
+                // itself is idle for the edge, so a runaway MultCap can never be
+                // confused with a hard closure and freeze the state machine
+                if (float.IsPositiveInfinity(g.ClosureMult[e]) && _state[e] == 0) continue;
                 float jc = jamCapacity[e], sr = serviceRate[e];
                 if (jc <= 0 || sr <= 0) continue;
                 bool jammed = occupancy[e] >= OccupancyEnter * jc && outflow[e] <= OutflowEnterFrac * sr;
@@ -71,7 +74,9 @@ namespace CS2Path.Core
                         else
                         {
                             if (!flowing) _counter[e] = 0;
-                            g.ClosureMult[e] = Math.Min(MultCap, g.ClosureMult[e] * MultGrowth);
+                            // clamp below +inf regardless of user MultCap: +inf is
+                            // the hard-closure sentinel and must stay reserved
+                            g.ClosureMult[e] = Math.Min(Math.Min(MultCap, 1e30f), g.ClosureMult[e] * MultGrowth);
                         }
                         break;
                     case 3:
@@ -96,6 +101,7 @@ namespace CS2Path.Core
             float target = closed ? float.PositiveInfinity : 1f;
             if (_g.ClosureMult[edge] != target)
             {
+                if (_state[edge] == 2 || _state[edge] == 3) SoftClosedCount--; // soft state absorbed by the hard closure
                 _g.ClosureMult[edge] = target;
                 _state[edge] = 0; _counter[edge] = 0;
                 changedEdges.Add(edge);

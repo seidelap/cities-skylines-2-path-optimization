@@ -40,7 +40,9 @@ namespace CS2Path.Core
                 settled.Add(v);
                 float dv = d[v];
                 if (v == t) dt = dv;
-                if (dv > dt * CorridorFactor) break;
+                // additive slack keeps the corridor meaningful under
+                // near-zero-cost metrics (e.g. pure-money with toll-free edges)
+                if (dv > dt * CorridorFactor + 1e-3f) break;
                 if (settled.Count > MaxSettled && float.IsPositiveInfinity(dt)) return false;
                 if (settled.Count > MaxSettled * 2) break;
                 for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++)
@@ -145,6 +147,7 @@ namespace CS2Path.Core
             {
                 int cur = s;
                 int guard = 0;
+                var firstAt = new Dictionary<int, int> { [s] = 0 };
                 while (cur != t)
                 {
                     if (!outAdj.TryGetValue(cur, out var l) || l.Count == 0) return false;
@@ -152,7 +155,16 @@ namespace CS2Path.Core
                     l.RemoveAt(l.Count - 1);
                     pathOut.Add(e);
                     cur = g.Head[e];
-                    if (++guard > n) return false;
+                    // splice out cycles so the walk is a simple path — dropping
+                    // union edges never breaks the pair's edge-disjointness
+                    if (firstAt.TryGetValue(cur, out var pos))
+                    {
+                        pathOut.RemoveRange(pos, pathOut.Count - pos);
+                        foreach (var kv2 in new List<KeyValuePair<int, int>>(firstAt))
+                            if (kv2.Value > pos) firstAt.Remove(kv2.Key);
+                    }
+                    else firstAt[cur] = pathOut.Count;
+                    if (++guard > 4 * n) return false;
                 }
                 return true;
             }

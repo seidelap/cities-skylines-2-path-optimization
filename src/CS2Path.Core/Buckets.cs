@@ -92,10 +92,16 @@ namespace CS2Path.Core
             }
         }
 
-        /// <summary>Rebuild the shared per-node buckets from destination labels.</summary>
+        /// <summary>Rebuild the shared per-node buckets from destination labels.
+        /// Also re-derives the per-category attraction upper bounds, so scalar
+        /// stock/price updates (which never re-run a backward search) keep the
+        /// scan's early-termination bound sound.</summary>
         public void RebuildBuckets()
         {
             for (int c = 0; c < Dests.CategoryCount; c++) Array.Clear(_buckets[c], 0, _buckets[c].Length);
+            Array.Clear(_maxAttract, 0, _maxAttract.Length);
+            for (int d = 0; d < Dests.Count; d++)
+                _maxAttract[Dests.Category[d]] = Math.Max(_maxAttract[Dests.Category[d]], Dests.AttractionSeconds[d]);
             EntriesTotal = 0;
             for (int d = 0; d < Dests.Count; d++)
             {
@@ -173,6 +179,8 @@ namespace CS2Path.Core
         private List<(int veh, int version, float dist)>?[] _buckets = null!;
         private int[] _vehicleVersion = null!;
         private int[] _vehicleNode = null!;
+        private long[] _vehicleEntryCount = null!;
+        private long _entriesTotal, _entriesLive;
 
         public static FleetIndex Create(CchQuery q, int fleetSize, int refMetric)
         {
@@ -182,21 +190,32 @@ namespace CS2Path.Core
                 _buckets = new List<(int, int, float)>?[q.C.NodeCount],
                 _vehicleVersion = new int[fleetSize],
                 _vehicleNode = new int[fleetSize],
+                _vehicleEntryCount = new long[fleetSize],
             };
         }
 
-        /// <summary>(Re-)post a vehicle's forward labels after it moves.</summary>
+        /// <summary>(Re-)post a vehicle's forward labels after it moves. Stale
+        /// entries are version-skipped at scan time and swept automatically once
+        /// they outnumber live ones (bounded memory without an explicit
+        /// maintenance schedule).</summary>
         public void PostVehicle(QueryContext ctx, int veh, int node)
         {
+            _entriesLive -= _vehicleEntryCount[veh];
             _vehicleVersion[veh]++;
             _vehicleNode[veh] = node;
             int ver = _vehicleVersion[veh];
+            long added = 0;
             _q.ForwardUpwardLabels(ctx, node, RefMetric, (u, df) =>
             {
                 var list = _buckets[u];
                 if (list == null) { list = new List<(int, int, float)>(4); _buckets[u] = list; }
                 list.Add((veh, ver, df));
+                added++;
             });
+            _vehicleEntryCount[veh] = added;
+            _entriesTotal += added;
+            _entriesLive += added;
+            if (_entriesTotal > 2 * _entriesLive + 1024) { Compact(); _entriesTotal = _entriesLive; }
         }
 
         /// <summary>One search per request: nearest vehicle by live cost.</summary>
