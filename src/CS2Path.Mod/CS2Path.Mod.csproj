@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Game-facing adapter skeleton (plan §5). This project holds the ONLY two
+       classes that are allowed to touch Colossal Order code: the reader adapter
+       (ECS -> IGraphSource/IMetricFeed/IWorldEvents) and the writer adapter
+       (PlanPortfolio -> PathOwner/CarNavigation components). In this repository
+       it compiles against Core only, with the game touchpoints stubbed and
+       documented; wiring to Game.dll happens in the game's Mods build. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <DefineConstants>$(DefineConstants);OUT_OF_GAME_BUILD</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../CS2Path.Core/CS2Path.Core.csproj" />
+  </ItemGroup>
+
+</Project>
