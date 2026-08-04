@@ -33,55 +33,35 @@ namespace CS2Path.Mod
         public int MaxDemandSamples = 500_000;
 
         /// <summary>Snapshot the lane graph. Called once, on demand (a mod
-        /// keybind or dev console command), never on the hot path.</summary>
-        public CityExport CaptureGraph()
+        /// keybind or dev console command), never on the hot path.
+        ///
+        /// The ECS reading lives in <see cref="GraphExporterSystem"/>; pass the
+        /// system in so this class stays a plain container that the harness-side
+        /// tests can exercise without a game world.
+        ///
+        /// Note on node identity (matters for ClusterCache.RemapAfterRebuild):
+        /// our node ids are dense indices assigned in PathNode-discovery order,
+        /// so they are NOT stable across exports. A review of this repo proved
+        /// that range-checking ids across a rebuild silently re-keys cache
+        /// entries onto wrong corridors — so if the live adapter ever rebuilds
+        /// the graph, it must retain its PathNode -> index map and hand the
+        /// old→new mapping to RemapAfterRebuild. Exports are one-shot snapshots
+        /// and do not have this problem.</summary>
+        public CityExport CaptureGraph(
+#if OUT_OF_GAME_BUILD
+            object? exporterSystem = null
+#else
+            GraphExporterSystem exporterSystem
+#endif
+        )
         {
 #if OUT_OF_GAME_BUILD
             throw new NotSupportedException(
-                "Out-of-game build. Build with -p:InGame=true on a machine with CS2 installed " +
-                "(deploy/gcp provisions one). See the ECS reading plan in the comments below.");
+                "Out-of-game build. Build with -p:InGame=true on a machine that has CS2 and the " +
+                "official modding toolchain installed (deploy/gcp provisions one).");
 #else
-            // ===============================================================
-            // IN-GAME IMPLEMENTATION PLAN
-            //
-            // The core routes on a directed edge graph whose nodes are lane
-            // endpoints and whose edges are (lane traversal | permitted turn).
-            // That expansion is what makes turn costs representable at all
-            // (plan §3: "turn costs require edge-based graph treatment").
-            //
-            // 1. Enumerate lanes:
-            //      EntityQuery over Game.Net.Lane + Game.Net.Curve, filtered to
-            //      car lanes (Game.Net.CarLane) for the first export. Each lane
-            //      becomes a node pair (start, end) and one edge between them.
-            //        timeFree = curve length / lane speed limit
-            //        money    = length * fuel coefficient (+ toll if present)
-            //        comfort  = length * road-class discomfort coefficient
-            //        capacity = per-tick service rate from the lane's road class
-            //        jamCap   = length / vehicle spacing
-            //
-            // 2. Enumerate connections:
-            //      Game.Net.LaneConnection / the node's connected-lane buffer
-            //      gives permitted lane-to-lane transitions. Each becomes a
-            //      zero-length edge carrying the TURN cost, which is exactly the
-            //      thing an edge-based graph exists to represent.
-            //
-            // 3. Coordinates:
-            //      Game.Net.Node.m_Position (or the curve midpoint) -> X/Y.
-            //      These feed nested dissection's geometric bisection, so their
-            //      quality directly drives A1. Do not skip them.
-            //
-            // 4. Stable id table:
-            //      Keep Entity -> int index in a NativeHashMap and RETAIN it.
-            //      ClusterCache.RemapAfterRebuild requires an old->new node id
-            //      mapping across rebuilds; a review of this repo proved that
-            //      range-checking ids instead silently re-keys cache entries onto
-            //      wrong corridors. The exporter is where that table is born.
-            //
-            // Validation before writing: CityExport.Validate() catches
-            // out-of-range endpoints and non-finite times — an exporter bug must
-            // fail here, loudly, not surface later as a mysterious routing result.
-            // ===============================================================
-            throw new NotImplementedException("in-game ECS capture");
+            if (exporterSystem == null) throw new ArgumentNullException(nameof(exporterSystem));
+            return exporterSystem.Capture();
 #endif
         }
 

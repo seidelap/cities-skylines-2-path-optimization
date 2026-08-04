@@ -34,6 +34,10 @@ src/CS2Path.Core/      Pure routing core — NO game assembly references (plan �
   Ports.cs               The stable interfaces the game adapters talk through
 
 src/CS2Path.Mod/       The ONLY code allowed to touch Colossal Order assemblies:
+  Mod.cs                 IMod entry point (observe-only: plan §5 step 1, no vanilla
+                         system disabled, nothing written back — cannot corrupt a save)
+  GraphExporterSystem.cs ECS → CityExport: walks Game.Net lanes into our graph
+  GraphExporter.cs       trace accumulation + file writing
   GameAdapters.cs        reader (ECS → GraphSource/MetricFeed/WorldEvents) and
                          writer (chosen plans → PathOwner/PathElement) adapter stubs,
                          with the in-game wiring documented inline
@@ -98,6 +102,30 @@ Measured results: see [`RESULTS.md`](RESULTS.md).
 * **Platoon self-metering** — decision events are evaluated arrival-ordered (FIFO),
   but cost updates land at refresh granularity, so a platoon's later members see
   the diversions of those ahead only across refresh boundaries.
+
+### Game-API status (verified vs still unverified)
+
+The mod-side code was written against shipped open-source CS2 mods, not from
+guesswork. **Verified:** the official toolchain build (`CSII_TOOLPATH` →
+`Mod.props`/`Mod.targets`); `Game.Modding.IMod` with `OnLoad(UpdateSystem)`;
+`updateSystem.UpdateAt<T>(SystemUpdatePhase.X)` registration; and the `Game.Net`
+traversal API — `Node`, `Edge(m_Start,m_End)`, `Lane(m_StartNode,m_MiddleNode,
+m_EndNode)`, `Curve(m_Bezier,m_Length)`, `CarLane(m_Flags)`,
+`ConnectedEdge(m_Edge,m_End)`, `SubLane(m_SubLane)`, `PrefabRef(m_Prefab)`,
+`CarLaneData`.
+
+This produced one substantive simplification: **CS2's lane network is already an
+edge-based graph.** Each `Lane` entity is a directed traversal between two
+`PathNode`s, and intersection movements are themselves lanes — so turn costs come
+for free and the lane/turn expansion the design doc specified is unnecessary.
+
+**Still unverified, and marked in-code:** the exact speed-limit member on
+`CarLane`/`CarLaneData` (isolated in one method so a wrong name is a compile
+error, not a silent wrong metric), the game-units→m/s scale factor, and the
+vanilla pathfinding system type names to disable when the engine swap lands.
+`GraphExporterSystem` also emits a connectivity diagnostic (mean node degree) so
+a wrong `PathNode` identity assumption shows up loudly rather than as a
+plausible-looking graph.
 
 ### Modeling constraints (documented decisions, not code)
 
