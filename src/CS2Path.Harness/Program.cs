@@ -436,7 +436,7 @@ namespace CS2Path.Harness
 
             Console.WriteLine($"sim: integrated simulation, {nTrips:N0} trips over {ticks} ticks...");
             var city = SyntheticCity.Build(cols, rows, 50_000, 5_000, seed);
-            var anchors = city.BuildAnchors(profiles);
+            var anchors = city.BuildAnchors(profiles, includeTypical: true);
             var eng = RoutingEngine.Build(city.G, anchors);
             var sim = TrafficSim.Create(city.G, city.JamCapacity, SimMode.Rebuild, eng);
             // integration-sim planner config: per-trip micro-costs are measured

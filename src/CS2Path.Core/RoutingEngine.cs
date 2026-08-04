@@ -62,6 +62,16 @@ namespace CS2Path.Core
             Metrics.PartialCustomize(changedEdges, start, Anchors.ProfileCount);
         }
 
+        /// <summary>Refresh the typical-scenario lanes after the rolling average
+        /// moves materially (slow EMA: rare, cheap). No-op without a Typical
+        /// scenario in the grid.</summary>
+        public void RefreshTypical(List<int> changedEdges)
+        {
+            if (changedEdges.Count == 0 || !Anchors.HasScenario(Scenario.Typical)) return;
+            int start = Anchors.ScenarioBlockStart(Scenario.Typical);
+            Metrics.PartialCustomize(changedEdges, start, Anchors.ProfileCount);
+        }
+
         /// <summary>Refresh ALL lane blocks for closure-state transitions. Hard
         /// closures (+inf) define the edge weight in EVERY scenario, so a
         /// close/reopen must recustomize free-flow and typical lanes too —

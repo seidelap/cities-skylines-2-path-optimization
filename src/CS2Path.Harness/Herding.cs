@@ -125,7 +125,8 @@ namespace CS2Path.Harness
                 var prng = new SplitMix64(seed);
                 for (int i = 0; i < 500; i++)
                     pop.Add(new Preference(1f + 0.1f * prng.NextFloat(), 0.02f * prng.NextFloat(), 0.02f * prng.NextFloat()));
-                var anchors = AnchorGrid.Build(pop, null, 5, new[] { CS2Path.Core.Scenario.FreeFlow, CS2Path.Core.Scenario.Live }, seed);
+                var anchors = AnchorGrid.Build(pop, null, 5,
+                    new[] { CS2Path.Core.Scenario.FreeFlow, CS2Path.Core.Scenario.Typical, CS2Path.Core.Scenario.Live }, seed);
                 eng = RoutingEngine.Build(sc.G, anchors);
             }
             var sim = TrafficSim.Create(sc.G, sc.Jam, mode, eng);
@@ -134,9 +135,13 @@ namespace CS2Path.Harness
             if (sim.Planner != null)
             {
                 // congestion swings make corridors comparable over a wide band:
-                // widen the envelope and the choice noise accordingly (§4 L4)
+                // widen the envelope and the choice noise, and lean the choice
+                // utility on the rolling-average scenario — the stable signal
+                // that lets logit split cohorts instead of herding them onto
+                // the momentarily cheapest corridor
                 sim.Planner.Cfg.EnvelopeEps = 0.60f;
-                sim.Planner.Cfg.LogitScale = 0.10f;
+                sim.Planner.Cfg.LogitScale = 0.13f;
+                sim.Planner.Cfg.TypicalBlend = 0.7f;
             }
 
             // identical synchronized cohort demand in both modes

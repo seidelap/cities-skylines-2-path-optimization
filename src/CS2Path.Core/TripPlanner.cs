@@ -12,6 +12,14 @@ namespace CS2Path.Core
         public int PenaltyIters = 2;
         public float LogitScale = 0.04f;      // Gumbel noise scale, relative to best cost
         public float EnvelopeEps = 0.30f;     // ε-envelope retention (§4.8)
+        /// <summary>Weight of the "typical" (rolling-average) scenario in the
+        /// CHOICE utility (plan §4 L1's third scenario axis). Live costs swing
+        /// with every queue; typical costs are the stable signal that lets logit
+        /// split cohorts across genuinely comparable routes instead of herding
+        /// onto the momentarily cheapest. 0 = pure live. Ignored when the
+        /// anchor grid carries no Typical scenario. Certificates always run on
+        /// pure live costs regardless.</summary>
+        public float TypicalBlend = 0.3f;
         public float CertTolerance = 2e-3f;   // certified-exact threshold (float slack)
         public float RepairGapThreshold = 0.01f;
         public int RepairMaxSettled = 2000;   // repair is best-effort: past this the potential was too loose
@@ -78,6 +86,7 @@ namespace CS2Path.Core
             _m = m; _c = m.C; _g = _c.G; _q = q; _anchors = m.Anchors;
             _ctx = q.CreateContext();
             _astar = new PotentialAStar(m, q);
+            _hasTypical = _anchors.HasScenario(Scenario.Typical);
         }
 
         public QueryContext Ctx => _ctx;
@@ -259,6 +268,7 @@ namespace CS2Path.Core
             // Overlap filter against already-accepted alternatives (shared live-time share).
             var acceptedEdges = new List<HashSet<int>>();
             plan.Alts.Clear();
+            _choiceScores.Clear();
             var acceptedGeoms = new List<List<int>>();
             foreach (var cand in scored)
             {
@@ -281,6 +291,7 @@ namespace CS2Path.Core
                 }
                 if (tooSimilar) continue;
                 plan.Alts.Add(cand.alt);
+                _choiceScores.Add(BlendedAlphaCost(cand.edges, in alpha, cand.alt.AlphaCost));
                 acceptedGeoms.Add(cand.edges);
                 var hs = new HashSet<int>();
                 foreach (var e in cand.edges) hs.Add(e);
@@ -291,6 +302,18 @@ namespace CS2Path.Core
         }
 
         private List<List<int>> _acceptedGeomsScratch = new List<List<int>>();
+        private readonly List<float> _choiceScores = new List<float>(); // aligned with plan.Alts
+        private readonly bool _hasTypical;
+
+        private float BlendedAlphaCost(List<int> edges, in Preference alpha, float alphaLive)
+        {
+            float w = _hasTypical ? Cfg.TypicalBlend : 0f;
+            if (w <= 0f) return alphaLive;
+            float typ = 0f;
+            foreach (var e in edges)
+                typ += alpha.Dot(_g.TimeTypical[e], _g.Money[e], _g.Comfort[e]);
+            return (1 - w) * alphaLive + w * typ;
+        }
 
         /// <summary>§4.7: LB(alpha) = max over conic decompositions of
         /// sum(lambda_i * d_i*), with lambda chosen by the tiny LP
@@ -345,6 +368,7 @@ namespace CS2Path.Core
                         AnchorCost = anchorCost, AlphaCost = d,
                     });
                     _acceptedGeomsScratch.Insert(0, new List<int>(_pathBuf2));
+                    _choiceScores.Insert(0, BlendedAlphaCost(_pathBuf2, in alpha, d));
                     plan.BestAlphaCost = d;
                     Stats.RepairImproved++;
                 }
@@ -360,11 +384,13 @@ namespace CS2Path.Core
         private void Choose(TripPlan plan, int s, int t, int nearK)
         {
             var rng = new SplitMix64(plan.Seed);
+            bool blended = _choiceScores.Count == plan.Alts.Count;
             float eta = Cfg.LogitScale * plan.BestAlphaCost;
             int best = -1; float bestU = float.NegativeInfinity;
             for (int i = 0; i < plan.Alts.Count; i++)
             {
-                float u = -plan.Alts[i].AlphaCost + eta * rng.NextGumbel();
+                float score = blended ? _choiceScores[i] : plan.Alts[i].AlphaCost;
+                float u = -score + eta * rng.NextGumbel();
                 if (u > bestU) { bestU = u; best = i; }
             }
             plan.ChosenIdx = best;

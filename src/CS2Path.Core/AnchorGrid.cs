@@ -23,6 +23,7 @@ namespace CS2Path.Core
 
         public Preference PrefOf(int metric) => Profiles[metric % Profiles.Length];
         public Scenario ScenarioOf(int metric) => Scenarios[metric / Profiles.Length];
+        public bool HasScenario(Scenario s) => Array.IndexOf(Scenarios, s) >= 0;
         public int MetricIndex(int profileIdx, Scenario s)
         {
             int si = Array.IndexOf(Scenarios, s);

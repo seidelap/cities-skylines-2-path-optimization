@@ -58,6 +58,8 @@ namespace CS2Path.Harness
 
         private int _scheduleCursor;
         private float[]? _lastNotifiedMult;
+        private float[]? _typicalCustomized;
+        private readonly List<int> _typicalChanged = new List<int>();
         private readonly List<int> _changedEdges = new List<int>();
         private readonly List<(int, float, float)> _changedTriples = new List<(int, float, float)>();
         private readonly List<int> _closureChanged = new List<int>();
@@ -266,15 +268,31 @@ namespace CS2Path.Harness
             var g = G;
             _changedEdges.Clear(); _changedTriples.Clear(); _closureChanged.Clear();
 
-            // live estimate -> TimeLive for materially changed edges
+            // live estimate -> TimeLive for materially changed edges; the
+            // typical scenario tracks a slow rolling average of the same signal
+            // (plan §4 L1: "typical scenarios learned from rolling congestion
+            // averages") and recustomizes only when it drifts materially
+            bool hasTypical = Eng!.Anchors.HasScenario(CS2Path.Core.Scenario.Typical);
+            if (hasTypical && _typicalCustomized == null)
+                _typicalCustomized = (float[])g.TimeTypical.Clone();
             for (int e = 0; e < g.EdgeCount; e++)
             {
-                float old = g.TimeLive[e], now = LiveEstimate(e);
-                if (Math.Abs(now - old) > LiveChangeThreshold * old)
+                float est = LiveEstimate(e);
+                float old = g.TimeLive[e];
+                if (Math.Abs(est - old) > LiveChangeThreshold * old)
                 {
-                    g.TimeLive[e] = now;
+                    g.TimeLive[e] = est;
                     _changedEdges.Add(e);
-                    _changedTriples.Add((e, old, now));
+                    _changedTriples.Add((e, old, est));
+                }
+                if (hasTypical)
+                {
+                    g.TimeTypical[e] = 0.98f * g.TimeTypical[e] + 0.02f * est;
+                    if (Math.Abs(g.TimeTypical[e] - _typicalCustomized![e]) > LiveChangeThreshold * _typicalCustomized[e])
+                    {
+                        _typicalChanged.Add(e);
+                        _typicalCustomized[e] = g.TimeTypical[e];
+                    }
                 }
             }
 
@@ -309,6 +327,7 @@ namespace CS2Path.Harness
             // closure-state transitions (hard closures define every scenario)
             sw.Restart();
             if (_changedEdges.Count > 0) Eng!.RefreshLive(_changedEdges);
+            if (_typicalChanged.Count > 0) { Eng!.RefreshTypical(_typicalChanged); _typicalChanged.Clear(); }
             if (_closureChanged.Count > 0) Eng!.RefreshClosures(_closureChanged);
             MsCustomize += sw.Elapsed.TotalMilliseconds;
 
