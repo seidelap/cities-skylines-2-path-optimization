@@ -46,6 +46,53 @@ created minutes earlier with no usage history — so this is a gate, not a wait.
 
 Provisioning itself: [`README.md`](README.md) (`cs2 up`, Steam, Parsec).
 
+## 0b. Optional: let Claude drive the VM directly
+
+The VM can run Claude itself, so the loop stops routing through you. Two
+capabilities, and they are **not** the same tool:
+
+| work | tool | where |
+|---|---|---|
+| build the mod, read `Player.log`, run the harness, upload exports | **Bash** | Claude Code, CLI or Desktop |
+| load a save, click the CS2 UI, read the profiler | **computer use** | **Claude Desktop app only** |
+
+**Computer use in the CLI is macOS-only** — on Windows it exists solely in the
+Desktop app, which `startup.ps1` now installs. It is a research preview
+requiring a **Pro or Max** plan (not Team/Enterprise) and claude.ai
+authentication; third-party providers (Bedrock, Vertex, Foundry) are excluded.
+Prefer Bash wherever it reaches — Claude's own tool ordering does, and it is
+faster and deterministic.
+
+**The catch this solves.** Computer use captures an *active* interactive
+session. A cloud VM has no physical console, and a disconnected RDP session
+screenshots black — which is why GUI automation classically "works over RDP and
+dies when you close the window". Run once, over RDP, elevated:
+
+```powershell
+C:\cs2\unattended-desktop.ps1        # asks for the Windows password; -Disable reverts
+```
+
+It configures auto-logon (password held as an LSA secret via Sysinternals
+Autologon, not plaintext registry), disables the lock screen and screensaver,
+schedules a `tscon /dest:console` reclaim so disconnecting RDP leaves the
+desktop active, and adds Claude Desktop to session startup.
+
+Then, by hand once (2FA and GUI-only, deliberately not scripted):
+
+1. Sign into Claude Desktop → **Settings › General › Desktop app › Computer use**
+2. Sign into Steam (Steam Guard) and Parsec
+
+Note that **Parsec is then optional** — Claude Desktop captures the VM's own
+screen locally, so nothing is driven "through" a Parsec stream. Parsec is just
+how *you* watch.
+
+> **Cost interaction, already handled.** Auto-logon holds a console session
+> Active forever, and the idle guard used to treat any Active session as
+> activity — which would have pinned the VM awake at ~$1.40/hr indefinitely.
+> `idle-guard.ps1` now counts only `rdp-tcp` sessions; real console activity is
+> still caught via Parsec detection and GPU load. Verify with `cs2 status`
+> after your first unattended boot that it still shuts down.
+
 ## 1. Build and install the mod (on the workstation)
 
 ```powershell

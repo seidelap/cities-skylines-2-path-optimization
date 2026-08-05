@@ -23,7 +23,8 @@ locals {
     idle_shutdown_minutes = var.idle_shutdown_minutes
     max_session_hours     = var.max_session_hours
     export_bucket         = google_storage_bucket.exports.name
-    idle_guard_ps1        = file("${path.module}/idle-guard.ps1")
+    idle_guard_ps1         = file("${path.module}/idle-guard.ps1")
+    unattended_desktop_ps1 = file("${path.module}/unattended-desktop.ps1")
   })
 }
 

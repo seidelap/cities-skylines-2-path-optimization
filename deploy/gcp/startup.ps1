@@ -159,6 +159,33 @@ Write-Host "Pull it locally with:  cs2 pull $name"
 '@ | Set-Content "C:\cs2\upload-export.ps1"
 
 # ---------------------------------------------------------------------------
+Step "Claude Desktop"
+# Computer use on Windows is Desktop-app only — the CLI's computer-use MCP
+# server is macOS-only, so `claude` in a terminal here can drive Bash but not
+# the screen. Installing the Desktop app is what makes GUI steps (loading a
+# save, reading the profiler) automatable on this box.
+$claudeExe = "$env:LOCALAPPDATA\Programs\Claude\Claude.exe"
+if (-not (Test-Path $claudeExe) -and -not (Test-Path "$env:ProgramFiles\Claude\Claude.exe")) {
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri "https://claude.ai/api/desktop/win32/x64/setup/latest/redirect" -OutFile "D:\setup\claude-setup.exe"
+        Start-Process "D:\setup\claude-setup.exe" -ArgumentList "/S" -Wait
+        Step "Claude Desktop installed — sign in over RDP once, then enable Computer use in Settings"
+    } catch { Step "WARNING: Claude Desktop download failed: $($_.Exception.Message)" }
+}
+# Git for Windows is a prerequisite for the Desktop app's Code tab.
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+    try { winget install --id Git.Git -e --silent --accept-source-agreements --accept-package-agreements 2>$null | Out-Null } catch { }
+}
+
+# ---------------------------------------------------------------------------
+Step "Unattended-desktop helper"
+# Not applied automatically: it configures auto-logon and needs the Windows
+# password, so it is a deliberate one-time step you run over RDP.
+@'
+${unattended_desktop_ps1}
+'@ | Set-Content "C:\cs2\unattended-desktop.ps1"
+
+# ---------------------------------------------------------------------------
 Step "Idle guard"
 @'
 ${idle_guard_ps1}

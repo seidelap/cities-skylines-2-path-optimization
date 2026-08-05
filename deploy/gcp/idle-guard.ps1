@@ -54,10 +54,24 @@ function Get-GpuUtil {
 }
 
 function Test-InteractiveSession {
-    # An RDP session counts as activity: you are probably mid-setup.
+    # A REMOTE session counts as activity: you are probably mid-setup.
+    #
+    # Deliberately ignores the console session. Once unattended-desktop.ps1 is
+    # applied, auto-logon holds a console session Active from boot forever — so
+    # treating "any Active session" as activity would pin `busy` true and the
+    # VM would never idle-shut-down, burning ~$1.40/hr indefinitely. That is the
+    # single most expensive bug this file could have.
+    #
+    # Nothing is lost by ignoring it: real console activity arrives through
+    # Parsec (Test-ParsecActive) or shows up as GPU load, both checked
+    # separately. Only rdp-tcp sessions are counted here.
     try {
         $q = quser 2>$null
-        if ($q -and ($q | Select-String -Pattern 'Active')) { return $true }
+        if ($q) {
+            foreach ($line in $q) {
+                if ($line -match 'rdp-tcp' -and $line -match 'Active') { return $true }
+            }
+        }
     } catch { }
     return $false
 }
