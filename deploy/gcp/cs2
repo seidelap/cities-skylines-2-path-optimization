@@ -34,6 +34,15 @@ need gcloud
 [[ -n "$PROJECT" ]] || { echo "set project_id in $TFVARS" >&2; exit 1; }
 G=(gcloud --project "$PROJECT")
 
+# The billing-budget resource is read through billingbudgets.googleapis.com,
+# which REJECTS a plain user credential unless a quota project is attached.
+# Without these two, `terraform destroy` fails during the refresh phase and
+# tears down NOTHING while still exiting in a way that reads like progress —
+# i.e. you keep paying for disks you believe are gone. Verified the hard way.
+# Always confirm a teardown against `gcloud compute disks list`, not Terraform.
+export USER_PROJECT_OVERRIDE=true
+export GOOGLE_BILLING_PROJECT="$PROJECT"
+
 state() { "${G[@]}" compute instances describe "$NAME" --zone "$ZONE" --format='value(status)' 2>/dev/null || echo ABSENT; }
 
 case "${1:-help}" in

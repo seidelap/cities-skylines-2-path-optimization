@@ -40,7 +40,7 @@ Optionally set `billing_account` to also get budget alerts at 50/90/100%.
 
 ---
 
-## Before you apply: two things that will block you
+## Before you apply: three things that will block you
 
 1. **GPU quota — the global gate, not the per-SKU ones.** On a fresh project the
    regional `NVIDIA_L4_GPUS` / `NVIDIA_T4_VWS_GPUS` quotas are *already* 1, and CPU
@@ -58,7 +58,21 @@ Optionally set `billing_account` to also get budget alerts at 50/90/100%.
    (Compute Engine + Cloud Storage + IAM + budgets is the whole surface — there is no
    Cloud Run, GKE, or serverless component in this deploy.)
 
-2. **You are running on Windows Server, not Windows 11.** GCP does not offer desktop
+2. **Tearing down: verify in GCP, never trust Terraform's exit.** The
+   `google_billing_budget` resource is read through `billingbudgets.googleapis.com`,
+   which rejects a plain user credential that has no quota project attached. When
+   that happens `terraform destroy` fails during *refresh* and destroys **nothing**
+   — while producing output that skims as progress. The `cs2` script now exports
+   `USER_PROJECT_OVERRIDE=true` and `GOOGLE_BILLING_PROJECT` to prevent it. If you
+   ever destroy by hand, confirm with:
+   ```
+   gcloud compute disks list --project PROJECT      # disks are the idle cost
+   gcloud compute instances list --project PROJECT
+   ```
+   Persistent disks bill whether or not the VM runs, so a teardown you *believe*
+   succeeded is the expensive failure mode.
+
+3. **You are running on Windows Server, not Windows 11.** GCP does not offer desktop
    Windows. CS2 runs fine on Server 2022 with Desktop Experience, but two things are
    off by default and break streaming in confusing ways — the startup script fixes
    both (Windows Audio service, display sleep). If something feels haunted, read
