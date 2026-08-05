@@ -225,19 +225,25 @@ non-monotonic in the blend/noise parameters (0.6/0.10 measured best;
 
 | measure | value |
 |---|---|
-| wall time | 1,593 s (3.8x realtime) |
-| arrivals | 99,976 / 100,000 |
+| wall time | 929 s (6.5x realtime) |
+| arrivals | 99,975 / 100,000 |
 | trips planned (incl. regenerations) | 100,000 |
-| certified-exact fraction | 38.6 % |
-| planning time | 340.8 s total, 3,408 µs/trip |
-| movement | 12.02 ms/tick |
-| live-metric partial customization | 1800.38 ms/refresh |
-| Layer-4 wakes + re-pricing | 2284.55 ms/refresh |
-| re-prices / probes / regenerations | 2,158,875 / 0 / 0 |
-| route switches (past hysteresis) | 2,260 |
-| event wakes (metered) / region wakes / sweeper | 0 / 0 / 4,463 |
+| certified-exact fraction | 38.1 % |
+| planning time | 181.1 s total, 1,811 µs/trip |
+| movement | 5.83 ms/tick |
+| live-metric partial customization | 1177.52 ms/refresh |
+| Layer-4 wakes + re-pricing | 1271.60 ms/refresh |
+| re-prices / probes / regenerations | 2,157,273 / 0 / 0 |
+| route switches (past hysteresis) | 2,661 |
+| event wakes (metered) / region wakes / sweeper | 0 / 0 / 4,518 |
 | soft-closed edges at end | 0 |
 | unreachable-trip events | 0 |
+
+Re-measured under the flow partitioner: wall time fell 1,593 s -> 929 s and
+planning 3,408 -> 1,811 µs/trip. Part of that is the smaller cliques (planning,
+customization, wake re-pricing all scale with arc volume), part is container
+variance — the partitioner-independent movement cost also moved, so read the
+subsystem ratios, not the absolute wall-clock, as the structural signal.
 
 
 ## A1 answered on REAL road networks (not the synthetic city)
@@ -320,7 +326,7 @@ game. `harness import` already reports it whenever a demand trace is present
 | point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 174 µs p99 (94.5 µs median), 122× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; remaining gap to the absolute target is Burst-class constant factors |
 | full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques) | miss on absolute; the sweep is SIMD-lane-parallel and level-parallelizable — Burst-class headroom is large but this target is at risk and should be re-measured in-game |
 | typical partial customization < 1 ms | 6.9 ms median for a clustered congestion pocket (3,362 of 1.7M arcs — 0.2%); scattered random edges 92 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
-| sim speed ≥ 95% at 400k population | proxy only: 100k trips at 4.0× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
+| sim speed ≥ 95% at 400k population | proxy only: 100k trips at 6.5× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
 | oscillation amplitude reduced ≥ 5× | **5.9×** vs the oscillating vanilla regime (fast signal, re-measured under the flow partitioner); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |
 | zero increase in unreachable-trip failures | 0 unreachable events across bench + 100k-trip sim | met |
 | certified-exact ≥ 90%, mean gap < 1% | 77.8% certified at plan time (cold planner), gaps now logged as per-entry exploration demand rather than repaired synchronously | miss on the fraction; k-sweep shows anchor count is not the lever — §4.8 online adaptation consumes exactly the telemetry now emitted |
