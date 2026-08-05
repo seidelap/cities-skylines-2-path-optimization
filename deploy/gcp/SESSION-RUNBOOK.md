@@ -11,19 +11,38 @@ decide what to build next.
 | scale | how big is a real late-game lane graph? | capture diagnostics line | sizes memory + build budgets; 200k vs 2M nodes changes Burst planning |
 | Amdahl | what share of frame time is vanilla pathfinding? | profiler + the mod's system dump | the ceiling on the whole project — decides how hard to push the swap |
 
-## 0. Prerequisite: GPU quota (start this first — longest lead time)
+## 0. Prerequisite: GPU quota — DONE for `cs2path-lab`
 
-New GCP projects have zero GPU quota; the request can take days. Request BOTH
-SKUs so the L4-licensing question (see README) cannot block you:
+**Already granted; kept here as the recipe for any new project.**
+
+The blocker is *not* the per-SKU regional quotas. On a fresh project those are
+already sufficient — measured on two separate projects:
+
+| quota (us-central1) | fresh-project default | needed |
+|---|---|---|
+| `NVIDIA_L4_GPUS` | 1 | 1 |
+| `NVIDIA_T4_VWS_GPUS` | 1 | 1 |
+| `CPUS` | 200 | 8 |
+| `SSD_TOTAL_GB` / `DISKS_TOTAL_GB` | 500 / 4096 | ~250 |
+
+The one thing at zero is the **global** `GPUS_ALL_REGIONS`, which silently
+vetoes every regional GPU quota. Raise that alone:
 
 ```bash
-gcloud compute regions describe us-central1 \
-  --format="table(quotas.metric,quotas.limit)" | grep -i gpu
+gcloud services enable compute.googleapis.com cloudquotas.googleapis.com --project PROJECT
+gcloud alpha quotas preferences create \
+  --service=compute.googleapis.com --project=PROJECT \
+  --quota-id=GPUS-ALL-REGIONS-per-project --preferred-value=1 \
+  --preference-id=cs2path-gpus-all-regions --email=YOU@example.com \
+  --justification="Single-GPU Windows workstation, started on demand."
+
+# confirm (this is the authoritative read; the preference object lags)
+gcloud compute project-info describe --project PROJECT \
+  --format=json | python3 -c "import json,sys;[print(q) for q in json.load(sys.stdin)['quotas'] if q['metric']=='GPUS_ALL_REGIONS']"
 ```
 
-Then in Console → IAM & Admin → Quotas, request:
-- `NVIDIA_L4_GPUS` ≥ 1 (primary: g2-standard-8)
-- `NVIDIA_T4_VWS_GPUS` ≥ 1 (fallback: n1 + T4-vWS, licensing known-good)
+Both requests auto-approved in under two minutes, including on a project
+created minutes earlier with no usage history — so this is a gate, not a wait.
 
 Provisioning itself: [`README.md`](README.md) (`cs2 up`, Steam, Parsec).
 

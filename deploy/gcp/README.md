@@ -42,12 +42,21 @@ Optionally set `billing_account` to also get budget alerts at 50/90/100%.
 
 ## Before you apply: two things that will block you
 
-1. **GPU quota is zero on new projects.** Request it first — this is the single most
-   common multi-day delay.
+1. **GPU quota — the global gate, not the per-SKU ones.** On a fresh project the
+   regional `NVIDIA_L4_GPUS` / `NVIDIA_T4_VWS_GPUS` quotas are *already* 1, and CPU
+   and disk quotas are already ample. The single blocker is the **global**
+   `GPUS_ALL_REGIONS`, which sits at 0 and vetoes all of them. Raise that one — see
+   [`SESSION-RUNBOOK.md`](SESSION-RUNBOOK.md) §0 for the exact command. Measured
+   twice: auto-approved in under two minutes, even on a brand-new project.
+
+   Required APIs (Terraform will fail cryptically without them):
    ```
-   gcloud compute regions describe us-central1 --format="table(quotas.metric,quotas.limit)" | grep -i gpu
+   gcloud services enable compute.googleapis.com storage.googleapis.com \
+     iam.googleapis.com cloudresourcemanager.googleapis.com serviceusage.googleapis.com \
+     cloudquotas.googleapis.com billingbudgets.googleapis.com --project PROJECT
    ```
-   Then raise `NVIDIA_L4_GPUS` (or `NVIDIA_T4_VWS_GPUS`) in IAM & Admin → Quotas.
+   (Compute Engine + Cloud Storage + IAM + budgets is the whole surface — there is no
+   Cloud Run, GKE, or serverless component in this deploy.)
 
 2. **You are running on Windows Server, not Windows 11.** GCP does not offer desktop
    Windows. CS2 runs fine on Server 2022 with Desktop Experience, but two things are
