@@ -75,6 +75,31 @@ namespace CS2Path.Mod
             _traffic.Add(new CityExport.TrafficSample { Tick = tick, Edge = edge, LiveSeconds = liveSeconds });
         }
 
+        // Delta filter state: last value actually recorded per edge.
+        private readonly System.Collections.Generic.Dictionary<int, float> _lastRecorded
+            = new System.Collections.Generic.Dictionary<int, float>();
+
+        /// <summary>Delta-filtered traffic recording: append only when the value
+        /// moved more than <paramref name="minRelDelta"/> since the last sample
+        /// recorded for this edge. Two things follow, both load-bearing:
+        /// (1) a full-city trace stays tens of MB instead of hundreds — a
+        /// quiescent lane costs nothing after its first sample; and (2) the
+        /// samples at tick T are exactly the CHANGED-edge set of that refresh,
+        /// which is what the harness A3 analysis replays through partial
+        /// customization to measure real change locality (clustered vs
+        /// scattered — a 13× cost swing in the synthetic benchmark).</summary>
+        public bool TryRecordTraffic(int tick, int edge, float liveSeconds, float minRelDelta)
+        {
+            if (_traffic.Count >= MaxTrafficSamples) return false;
+            if (!(liveSeconds > 0) || float.IsNaN(liveSeconds) || float.IsInfinity(liveSeconds)) return false;
+            if (_lastRecorded.TryGetValue(edge, out float prev)
+                && Math.Abs(liveSeconds - prev) <= minRelDelta * Math.Max(1e-3f, prev))
+                return false;
+            _lastRecorded[edge] = liveSeconds;
+            _traffic.Add(new CityExport.TrafficSample { Tick = tick, Edge = edge, LiveSeconds = liveSeconds });
+            return true;
+        }
+
         /// <summary>Append one observed trip. This is the A2 evidence: the real
         /// origin-destination distribution, which is the only thing that can
         /// confirm or refute the cluster cache's hit rate.</summary>

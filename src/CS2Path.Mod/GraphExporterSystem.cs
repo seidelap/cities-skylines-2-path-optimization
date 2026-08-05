@@ -5,11 +5,13 @@ using CS2Path.Core;
 using Game;
 using Game.Common;
 using Game.Net;
+using Game.Pathfind;
 using Game.Prefabs;
 using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
+using ObjTransform = Game.Objects.Transform;
 #endif
 
 namespace CS2Path.Mod
@@ -47,6 +49,7 @@ namespace CS2Path.Mod
     public partial class GraphExporterSystem : GameSystemBase
     {
         private EntityQuery _laneQuery;
+        private EntityQuery _tripQuery;
 
         protected override void OnCreate()
         {
@@ -67,10 +70,77 @@ namespace CS2Path.Mod
                     ComponentType.ReadOnly<Temp>(),
                 },
             });
-            Enabled = false; // on-demand only; Capture() is driven by the mod UI
+            // Every agent the game has computed a path for. PathInformation is
+            // the RESULT record (origin, destination, cost) — reading it observes
+            // the vanilla pathfinder's own output without touching its inputs.
+            _tripQuery = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<PathInformation>() },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Deleted>(),
+                    ComponentType.ReadOnly<Temp>(),
+                },
+            });
+            Enabled = false; // enabled only while a trace is running (BeginTrace)
         }
 
-        protected override void OnUpdate() { }
+        // ---- trace driver state ----
+        private GraphExporter? _traceSink;
+        private int _traceCadence = 64;   // frames between snapshots
+        private long _frame;
+        private int _traceTick;
+        private int _tripsRecorded, _tripsUnresolved, _tripsOutOfRange;
+        // agent entity -> destination we last recorded, so one commute = one
+        // sample regardless of how many frames its PathInformation persists.
+        private readonly Dictionary<Entity, Entity> _tripSeen = new Dictionary<Entity, Entity>();
+
+        /// <summary>Trips get a constant, documented preference vector: the A2
+        /// question (is demand spatially concentrated?) is a pure OD-geometry
+        /// question and does not depend on alpha. CS2 has no per-cim (time,
+        /// money, comfort) triple to read; deriving one from citizen archetypes
+        /// is future work and would land here.</summary>
+        public static readonly Preference UnknownAlpha = new Preference(1.5f, 0.55f, 0.25f);
+
+        /// <summary>Start cadenced trace recording into <paramref name="sink"/>.
+        /// Requires a prior Capture() in this session (the trace attributes
+        /// samples to that capture's edge/node ids — do not edit roads while a
+        /// trace runs; lanes that vanish are skipped, lanes built after the
+        /// capture are invisible to the trace).</summary>
+        public string BeginTrace(GraphExporter sink, int cadenceFrames = 64)
+        {
+            if (_nodeIndex == null)
+                throw new InvalidOperationException("BeginTrace requires a prior Capture() — the trace maps onto that capture's ids");
+            _traceSink = sink ?? throw new ArgumentNullException(nameof(sink));
+            _traceCadence = Math.Max(1, cadenceFrames);
+            _frame = 0;
+            _tripsRecorded = _tripsUnresolved = _tripsOutOfRange = 0;
+            _tripSeen.Clear();
+            Enabled = true;
+            return $"trace started: snapshot every {_traceCadence} frames";
+        }
+
+        public string EndTrace()
+        {
+            Enabled = false;
+            var sink = _traceSink;
+            _traceSink = null;
+            return sink == null
+                ? "no trace was running"
+                : $"trace ended: {_traceTick} snapshots, {sink.TrafficSampleCount} traffic samples, " +
+                  $"{sink.DemandSampleCount} trips ({_tripsRecorded} recorded, " +
+                  $"{_tripsUnresolved} endpoints without Transform, {_tripsOutOfRange} beyond snap radius)";
+        }
+
+        protected override void OnUpdate()
+        {
+            var sink = _traceSink;
+            if (sink == null) return;
+            if (++_frame % _traceCadence != 0) return;
+            int tick = _traceTick++;
+            SampleTraffic(tick, sink);
+            SampleTrips(tick, sink);
+        }
 
         /// <summary>Diagnostics from the last capture — printed by the caller so a
         /// wrong assumption is visible immediately instead of silently producing a
@@ -78,9 +148,17 @@ namespace CS2Path.Mod
         public string LastDiagnostics { get; private set; } = "";
 
         // Retained from the last Capture() so live traffic samples can be
-        // attributed to the right exported edge.
+        // attributed to the right exported edge, and trip endpoints snapped to
+        // the right exported node.
         private readonly Dictionary<Entity, int> _laneToEdge = new Dictionary<Entity, int>();
         private readonly List<float> _edgeLength = new List<float>();
+        private SpatialNodeIndex? _nodeIndex;
+
+        /// <summary>Snap radius for trip endpoints (metres). A building sits at
+        /// most a driveway from its road; anything farther means the endpoint's
+        /// network was not exported (e.g. pedestrian-only) and the sample is
+        /// dropped and counted rather than snapped somewhere wrong.</summary>
+        public float SnapRadius = 250f;
 
         public CityExport Capture()
         {
@@ -189,7 +267,80 @@ namespace CS2Path.Mod
                     : "connectivity looks sane");
 
             export.Validate();
+            _nodeIndex = new SpatialNodeIndex(export.X!, export.Y!);
             return export;
+        }
+
+        /// <summary>Record one demand sample per (agent, destination): read the
+        /// vanilla pathfinder's own result records, resolve both endpoint
+        /// entities to world positions, snap to the nearest exported node.
+        /// Verified components only: Game.Pathfind.PathInformation
+        /// (m_Origin/m_Destination are Entity refs) and Game.Objects.Transform
+        /// (m_Position). Endpoints without a Transform, or farther than
+        /// SnapRadius from any exported node, are dropped and counted.</summary>
+        private void SampleTrips(int tick, GraphExporter sink)
+        {
+            var em = EntityManager;
+            var index = _nodeIndex;
+            if (index == null) return;
+            using var agents = _tripQuery.ToEntityArray(Allocator.Temp);
+            using var infos = _tripQuery.ToComponentDataArray<PathInformation>(Allocator.Temp);
+            for (int i = 0; i < agents.Length; i++)
+            {
+                var info = infos[i];
+                if (info.m_Origin == Entity.Null || info.m_Destination == Entity.Null) continue;
+                if (_tripSeen.TryGetValue(agents[i], out var seenDest) && seenDest == info.m_Destination)
+                    continue; // same commute, already recorded
+                _tripSeen[agents[i]] = info.m_Destination;
+
+                if (!TryPosition(em, info.m_Origin, out float3 po) ||
+                    !TryPosition(em, info.m_Destination, out float3 pd))
+                { _tripsUnresolved++; continue; }
+
+                int o = index.NearestWithin(po.x, po.z, SnapRadius); // ground plane is (x, z)
+                int d = index.NearestWithin(pd.x, pd.z, SnapRadius);
+                if (o < 0 || d < 0 || o == d) { _tripsOutOfRange++; continue; }
+
+                sink.RecordDemand(tick, o, d, in UnknownAlpha);
+                _tripsRecorded++;
+            }
+        }
+
+        private static bool TryPosition(EntityManager em, Entity e, out float3 pos)
+        {
+            if (em.Exists(e) && em.HasComponent<ObjTransform>(e))
+            {
+                pos = em.GetComponentData<ObjTransform>(e).m_Position;
+                return true;
+            }
+            pos = default;
+            return false;
+        }
+
+        /// <summary>Enumerate every system in the world whose type name mentions
+        /// pathfinding, with its enabled state. Two consumers: (1) the engine
+        /// swap needs the exact vanilla system type names to disable — this
+        /// answers that empirically on first boot instead of from guesswork;
+        /// (2) the Amdahl measurement (what share of frame time is vanilla
+        /// pathfinding?) needs to know which rows to read in the profiler.
+        /// Call from OnLoad and log the result.</summary>
+        public static string DumpPathfindSystems(World world)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("systems matching 'Pathfind' (candidates to profile, and later disable):");
+            int n = 0;
+            foreach (var sys in world.Systems)
+            {
+                var t = sys.GetType();
+                if (t.FullName == null || t.FullName.IndexOf("Pathfind", StringComparison.OrdinalIgnoreCase) < 0)
+                    continue;
+                sb.AppendLine($"  {t.FullName}  enabled={sys.Enabled}");
+                n++;
+            }
+            sb.AppendLine(n == 0
+                ? "  NONE FOUND — the game renamed its pathfinding namespace; grep a decompile"
+                : $"  ({n} systems)");
+            return sb.ToString();
         }
 
         /// <summary>
@@ -286,8 +437,10 @@ namespace CS2Path.Mod
                 float length = _edgeLength[kv.Value];
                 if (!(observedSpeed > 0.1f) || !(length > 0f)) continue;
 
-                sink.RecordTraffic(tick, kv.Value, length / observedSpeed);
-                taken++;
+                // Delta-filtered: quiescent lanes cost one sample total, and the
+                // samples at each tick ARE that refresh's changed-edge set (A3).
+                if (sink.TryRecordTraffic(tick, kv.Value, length / observedSpeed, 0.02f))
+                    taken++;
             }
             return taken;
         }

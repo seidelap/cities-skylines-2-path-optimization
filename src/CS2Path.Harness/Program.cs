@@ -122,6 +122,55 @@ namespace CS2Path.Harness
                             Origin = erng.NextInt(sc.G.NodeCount), Dest = erng.NextInt(sc.G.NodeCount),
                             Alpha = sc.Citizens[erng.NextInt(sc.Citizens.Length)],
                         });
+                    // Synthetic congestion trace: drifting pockets emitted through
+                    // the same delta-filter semantics the in-game sampler uses, so
+                    // the A3 replay (grouping → partial customization → clustering
+                    // stat) is exercisable end-to-end before a real export exists.
+                    // Deliberately CLUSTERED — real locality is what the game
+                    // session measures; this only proves the pipeline.
+                    int traceTicks = (int)GetOpt(opts, "trace-ticks", 12);
+                    if (traceTicks > 0)
+                    {
+                        var trng = new SplitMix64(seed ^ 0xA3);
+                        const int pockets = 6;
+                        var centers = new int[pockets];
+                        for (int p = 0; p < pockets; p++) centers[p] = trng.NextInt(sc.G.NodeCount);
+                        var lastRec = new float[sc.G.EdgeCount];
+                        var ballNodes = new List<int>();
+                        var seen = new HashSet<int>();
+                        for (int t = 0; t < traceTicks; t++)
+                        {
+                            for (int p = 0; p < pockets; p++)
+                            {
+                                // pocket = out-edges of a BFS ball around the center
+                                ballNodes.Clear(); seen.Clear();
+                                ballNodes.Add(centers[p]); seen.Add(centers[p]);
+                                for (int bi = 0; bi < ballNodes.Count && ballNodes.Count < 60; bi++)
+                                {
+                                    int v = ballNodes[bi];
+                                    for (int e = sc.G.OutStart[v]; e < sc.G.OutStart[v + 1]; e++)
+                                        if (seen.Add(sc.G.Head[e])) ballNodes.Add(sc.G.Head[e]);
+                                }
+                                float factor = 1.6f + 0.7f * (float)Math.Sin(0.9 * t + p);
+                                foreach (int v in ballNodes)
+                                    for (int e = sc.G.OutStart[v]; e < sc.G.OutStart[v + 1]; e++)
+                                    {
+                                        float val = exp.TimeFree[e] * factor;
+                                        if (lastRec[e] > 0 && Math.Abs(val - lastRec[e]) <= 0.02f * lastRec[e]) continue;
+                                        lastRec[e] = val;
+                                        exp.Traffic.Add(new CityExport.TrafficSample { Tick = t, Edge = e, LiveSeconds = val });
+                                    }
+                                // slow drift so consecutive change sets overlap partially
+                                if ((t & 1) == 1)
+                                {
+                                    int c = centers[p];
+                                    if (sc.G.OutStart[c + 1] > sc.G.OutStart[c])
+                                        centers[p] = sc.G.Head[sc.G.OutStart[c]];
+                                }
+                            }
+                        }
+                        Console.WriteLine($"  trace: {traceTicks} snapshots, {exp.Traffic.Count:N0} delta samples ({pockets} drifting pockets)");
+                    }
                     using (var fs = File.Create(outPath)) exp.Write(fs);
                     Console.WriteLine($"wrote {outPath} ({new FileInfo(outPath).Length / 1e6:0.0} MB, " +
                                       $"{exp.NodeCount:N0} nodes, {exp.EdgeCount:N0} edges, {exp.Demand.Count:N0} trips)");

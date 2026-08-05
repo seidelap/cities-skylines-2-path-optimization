@@ -36,22 +36,56 @@ namespace CS2Path.Mod
 
 #if !OUT_OF_GAME_BUILD
         private GraphExporterSystem? _exporter;
+        // One writer for the whole session: trace samples accumulate here and
+        // ExportCity() merges them into the written file.
+        private readonly GraphExporter _writer = new GraphExporter();
+        // The capture a running trace attributes its samples to. Trace ids are
+        // only meaningful against this snapshot, so ExportCity() must write THIS
+        // graph, not a fresh re-capture (a re-capture may renumber).
+        private CityExport? _captured;
 
         public void OnLoad(UpdateSystem updateSystem)
         {
             // Modification5 is where network-derived systems settle (the lane
             // graph is coherent by then). The system is created disabled and only
-            // does work when Capture() is called, so the phase is really just
-            // where it lives, not a per-frame cost.
+            // does work when Capture()/BeginTrace() is called, so the phase is
+            // really just where it lives, not a per-frame cost.
             updateSystem.UpdateAt<GraphExporterSystem>(SystemUpdatePhase.Modification5);
 
             var world = World.DefaultGameObjectInjectionWorld;
             _exporter = world?.GetOrCreateSystemManaged<GraphExporterSystem>();
+
+            // First-boot diagnostic: the exact vanilla pathfinding system names
+            // (to profile now, to disable at the engine swap). Log, don't guess.
+            if (world != null)
+                UnityEngine.Debug.Log($"[{Name}] {GraphExporterSystem.DumpPathfindSystems(world)}");
         }
 
         public void OnDispose()
         {
             _exporter = null;
+        }
+
+        /// <summary>Capture the graph and begin cadenced trace recording (traffic
+        /// deltas + observed trips). Drive from a keybind/dev console; play
+        /// 20-30 min at normal speed, then StopTrace + ExportCity. Do not edit
+        /// roads mid-trace (ids are pinned to this capture).</summary>
+        public string StartTrace(int cadenceFrames = 64)
+        {
+            if (_exporter == null) throw new InvalidOperationException("mod not loaded");
+            _captured = _exporter.Capture();
+            UnityEngine.Debug.Log($"[{Name}] capture: {_exporter.LastDiagnostics}");
+            var msg = _exporter.BeginTrace(_writer, cadenceFrames);
+            UnityEngine.Debug.Log($"[{Name}] {msg}");
+            return msg;
+        }
+
+        public string StopTrace()
+        {
+            if (_exporter == null) throw new InvalidOperationException("mod not loaded");
+            var msg = _exporter.EndTrace();
+            UnityEngine.Debug.Log($"[{Name}] {msg}");
+            return msg;
         }
 
         /// <summary>
@@ -62,9 +96,10 @@ namespace CS2Path.Mod
         public string ExportCity(string path)
         {
             if (_exporter == null) throw new InvalidOperationException("mod not loaded");
-            var export = _exporter.Capture();
-            var writer = new GraphExporter();
-            writer.Write(export, path);
+            // Use the trace's pinned capture when one exists — trace edge/node
+            // ids are only valid against it. Fresh capture otherwise.
+            var export = _captured ?? _exporter.Capture();
+            _writer.Write(export, path);
             UnityEngine.Debug.Log($"[{Name}] export: {_exporter.LastDiagnostics}");
             UnityEngine.Debug.Log($"[{Name}] wrote {path} " +
                                   $"({export.NodeCount} nodes, {export.EdgeCount} edges, " +

@@ -122,11 +122,23 @@ for free and the lane/turn expansion the design doc specified is unnecessary.
 
 **Still unverified, and marked in-code:** the exact speed-limit member on
 `CarLane`/`CarLaneData` (isolated in one method so a wrong name is a compile
-error, not a silent wrong metric), the game-units→m/s scale factor, and the
-vanilla pathfinding system type names to disable when the engine swap lands.
+error, not a silent wrong metric) and the game-units→m/s scale factor
+(`CalibrateSpeedUnits` resolves it empirically from `LaneFlow`). The vanilla
+pathfinding system type names to disable are no longer guessed at all: the mod
+enumerates every world system matching "Pathfind" into the log at first boot.
 `GraphExporterSystem` also emits a connectivity diagnostic (mean node degree) so
 a wrong `PathNode` identity assumption shows up loudly rather than as a
 plausible-looking graph.
+
+The exporter also records **traces**, not just structure: cadenced
+delta-filtered traffic samples (each tick's samples are exactly that refresh's
+changed-edge set) and one demand sample per observed commute
+(`PathInformation` endpoints → `Transform` positions → nearest exported node,
+radius-bounded). `harness import` replays them as A2 (cache hit rate on real
+demand) and A3 (partial-customization cost + clustering on real change sets).
+See [`deploy/gcp/SESSION-RUNBOOK.md`](deploy/gcp/SESSION-RUNBOOK.md) for the
+session that collects everything, including the frame-time share of vanilla
+pathfinding (the Amdahl ceiling).
 
 ### Modeling constraints (documented decisions, not code)
 

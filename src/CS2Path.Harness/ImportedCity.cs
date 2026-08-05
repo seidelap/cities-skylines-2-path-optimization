@@ -116,6 +116,70 @@ namespace CS2Path.Harness
             if (bad > 0)
                 sb.AppendLine($"> **{bad} mismatches on the real graph** — investigate before trusting any other number here.");
 
+            // ---- A3: congestion-change locality (clustered vs scattered) ----
+            // The §6 partial-customization target lives entirely inside a 13×
+            // cost swing between clustered and scattered change (6.9 ms vs
+            // 92 ms at 131k synthetic). The trace's delta-filtered samples at
+            // each tick ARE that refresh's changed-edge set, so we can replay
+            // them through partial customization and measure the real thing.
+            var byTick = new SortedDictionary<int, List<CityExport.TrafficSample>>();
+            foreach (var s in city.Traffic)
+            {
+                if (!byTick.TryGetValue(s.Tick, out var lst)) byTick[s.Tick] = lst = new List<CityExport.TrafficSample>();
+                lst.Add(s);
+            }
+            if (byTick.Count >= 2)
+            {
+                var refreshMs = new List<double>();
+                var arcsTouched = new List<double>();
+                var changedCounts = new List<double>();
+                var comps = new List<double>();
+                var shares = new List<double>();
+                bool first = true;
+                var changed = new List<int>();
+                foreach (var kv in byTick)
+                {
+                    changed.Clear();
+                    foreach (var s in kv.Value)
+                        if (s.Edge >= 0 && s.Edge < g.EdgeCount && float.IsFinite(s.LiveSeconds) && s.LiveSeconds > 0)
+                        { g.TimeLive[s.Edge] = s.LiveSeconds; changed.Add(s.Edge); }
+                    if (changed.Count == 0) continue;
+                    if (first) { eng.RefreshLive(changed); first = false; continue; } // pin to trace start, untimed
+                    long rt0 = Stopwatch.GetTimestamp();
+                    eng.RefreshLive(changed);
+                    refreshMs.Add((Stopwatch.GetTimestamp() - rt0) * 1000.0 / Stopwatch.Frequency);
+                    arcsTouched.Add(eng.Metrics.LastPartialArcsRecomputed);
+                    changedCounts.Add(changed.Count);
+                    ClusterChangedEdges(g, changed, out int nComp, out _, out float share);
+                    comps.Add(nComp);
+                    shares.Add(share);
+                }
+                if (refreshMs.Count > 0)
+                {
+                    sb.AppendLine("### A3 — congestion-change locality (is real change clustered or scattered?)");
+                    sb.AppendLine();
+                    sb.AppendLine("| measure | this trace | synthetic reference |");
+                    sb.AppendLine("|---|---|---|");
+                    sb.AppendLine($"| refresh transitions replayed | {refreshMs.Count} | — |");
+                    sb.AppendLine($"| changed edges / transition (median) | {Pct(changedCounts, 0.5):N0} | 100–1,000 |");
+                    sb.AppendLine($"| partial customization median / p99 | {Pct(refreshMs, 0.5):0.0} ms / {Pct(refreshMs, 0.99):0.0} ms | clustered 6.9 ms, scattered 92 ms @131k |");
+                    sb.AppendLine($"| arcs recomputed (median) | {Pct(arcsTouched, 0.5):N0} | clustered ~3.4k, scattered ~43k |");
+                    sb.AppendLine($"| connected components per change set (median) | {Pct(comps, 0.5):N0} | clustered: few |");
+                    sb.AppendLine($"| share of changed edges in components ≥ 3 | {shares.Average():P0} | clustered: high |");
+                    sb.AppendLine();
+                    Console.WriteLine($"  A3: transitions={refreshMs.Count} changed-median={Pct(changedCounts, 0.5):N0} " +
+                                      $"refresh median={Pct(refreshMs, 0.5):0.0}ms p99={Pct(refreshMs, 0.99):0.0}ms " +
+                                      $"clustered-share={shares.Average():P0}");
+                }
+            }
+            else if (city.Traffic.Count > 0)
+            {
+                sb.AppendLine("### A3 — congestion-change locality");
+                sb.AppendLine();
+                sb.AppendLine("_Trace carries a single snapshot — record with the cadenced sampler (StartTrace) to measure change locality._");
+                sb.AppendLine();
+            }
+
             // ---- A2: demand locality / cache hit rate ----
             if (city.Demand.Count > 0)
             {
@@ -172,6 +236,49 @@ namespace CS2Path.Harness
             if (xs.Count == 0) return double.NaN;
             var s = xs.OrderBy(x => x).ToList();
             return s[Math.Min(s.Count - 1, (int)(p * s.Count))];
+        }
+
+        /// <summary>Union-find over a changed-edge set, joining edges that share
+        /// an endpoint. A congestion pocket reads as one big component; scattered
+        /// noise reads as singletons. clusteredShare = fraction of changed edges
+        /// in components of size ≥ 3. Public so the verify suite can pin the
+        /// classifier on hand-built patterns.</summary>
+        public static void ClusterChangedEdges(Graph g, List<int> edges,
+            out int components, out int largest, out float clusteredShare)
+        {
+            int n = edges.Count;
+            components = 0; largest = 0; clusteredShare = 0f;
+            if (n == 0) return;
+            var parent = new int[n];
+            for (int i = 0; i < n; i++) parent[i] = i;
+            int Find(int a) { while (parent[a] != a) a = parent[a] = parent[parent[a]]; return a; }
+            void Union(int a, int b) { a = Find(a); b = Find(b); if (a != b) parent[a] = b; }
+
+            var nodeToEdge = new Dictionary<int, int>(n * 2);
+            for (int i = 0; i < n; i++)
+            {
+                int e = edges[i];
+                foreach (int v in new[] { g.Tail[e], g.Head[e] })
+                {
+                    if (nodeToEdge.TryGetValue(v, out int j)) Union(i, j);
+                    else nodeToEdge[v] = i;
+                }
+            }
+            var sizes = new Dictionary<int, int>();
+            for (int i = 0; i < n; i++)
+            {
+                int r = Find(i);
+                sizes.TryGetValue(r, out int c);
+                sizes[r] = c + 1;
+            }
+            components = sizes.Count;
+            int inBig = 0;
+            foreach (var c in sizes.Values)
+            {
+                if (c > largest) largest = c;
+                if (c >= 3) inBig += c;
+            }
+            clusteredShare = (float)inBig / n;
         }
     }
 }

@@ -53,9 +53,11 @@ namespace CS2Path.Mod
     //    World.GetOrCreateSystemManaged(...).Enabled = false (the sanctioned
     //    wholesale-replacement pattern — the Burst hot path cannot be
     //    Harmony-patched); the replacement systems are then registered above.
-    //    STILL UNVERIFIED: the exact vanilla system type names to disable, and
-    //    the exact Game.Net component/buffer names for lanes and connections.
-    //    Read those off a network-touching mod before writing the exporter body.
+    //    The exact vanilla system type names to disable are answered
+    //    EMPIRICALLY at first boot: GraphExporterSystem.DumpPathfindSystems
+    //    enumerates every world system matching "Pathfind" into the log
+    //    (see deploy/gcp/SESSION-RUNBOOK.md) — do not hardcode names from
+    //    guesswork; read them off that dump.
     //  * Feature flags (FeatureFlags) are surfaced as mod options so every
     //    layer is independently revertible to vanilla behavior at runtime.
     //  * Version discipline: pin game version, per patch decompile + diff the

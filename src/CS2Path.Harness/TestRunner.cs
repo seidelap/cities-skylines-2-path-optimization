@@ -55,6 +55,10 @@ namespace CS2Path.Harness
             VerifyEventDrivenBuckets(seed + 13);
             Console.WriteLine("verify: city-export round trip (format + corruption detection)...");
             VerifyCityExport(seed + 15);
+            Console.WriteLine("verify: spatial nearest-node index vs brute force...");
+            VerifySpatialIndex(seed + 16);
+            Console.WriteLine("verify: A3 change-locality classifier (pocket vs scattered)...");
+            VerifyChangeLocality(seed + 17);
             Console.WriteLine("verify: §4.9 cluster cache (hits, quarantine, async exploration)...");
             VerifyClusterCache(seed + 11);
             Console.WriteLine("verify: cache remap after re-dissection, warmup governor, telemetry...");
@@ -632,6 +636,77 @@ namespace CS2Path.Harness
             try { CityExport.Read(new System.IO.MemoryStream(ms.ToArray(), 0, (int)(ms.Length / 2))); }
             catch (Exception) { truncCaught = true; }
             Check(truncCaught, "truncated export was accepted instead of rejected");
+        }
+
+        private static void VerifySpatialIndex(ulong seed)
+        {
+            var rng = new SplitMix64(seed);
+            int n = 3000;
+            var x = new float[n]; var y = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                // clumpy distribution: half uniform, half in tight clusters,
+                // mimicking road nodes along corridors
+                if ((i & 1) == 0) { x[i] = rng.NextFloat() * 8000f; y[i] = rng.NextFloat() * 6000f; }
+                else { x[i] = x[i - 1] + (rng.NextFloat() - 0.5f) * 40f; y[i] = y[i - 1] + (rng.NextFloat() - 0.5f) * 40f; }
+            }
+            var idx = new SpatialNodeIndex(x, y);
+            int wrong = 0, rejects = 0, found = 0;
+            for (int q = 0; q < 500; q++)
+            {
+                float px = rng.NextFloat() * 9000f - 500f, py = rng.NextFloat() * 7000f - 500f;
+                float radius = q % 3 == 0 ? 60f : 250f;
+                int got = idx.NearestWithin(px, py, radius);
+                int want = -1; float best = radius * radius;
+                for (int i = 0; i < n; i++)
+                {
+                    float dx = x[i] - px, dy = y[i] - py, d2 = dx * dx + dy * dy;
+                    if (d2 <= best) { best = d2; want = i; }
+                }
+                if (got != want)
+                {
+                    // ties at identical distance are acceptable either way
+                    float D2(int v) { float dx = x[v] - px, dy = y[v] - py; return dx * dx + dy * dy; }
+                    if (got < 0 || want < 0 || Math.Abs(D2(got) - D2(want)) > 1e-3f) wrong++;
+                }
+                if (got < 0) rejects++; else found++;
+            }
+            Check(wrong == 0, $"spatial index disagreed with brute force on {wrong}/500 queries");
+            Check(found > 0 && rejects > 0, $"degenerate spatial test coverage (found={found} rejects={rejects})");
+        }
+
+        private static void VerifyChangeLocality(ulong seed)
+        {
+            var city = SyntheticCity.Build(30, 30, 500, 100, seed);
+            var g = city.G;
+            var rng = new SplitMix64(seed);
+
+            // pocket: all out-edges of a BFS ball -> one dominant component
+            var ball = new List<int> { g.NodeCount / 2 };
+            var seen = new HashSet<int> { g.NodeCount / 2 };
+            for (int bi = 0; bi < ball.Count && ball.Count < 40; bi++)
+                for (int e = g.OutStart[ball[bi]]; e < g.OutStart[ball[bi] + 1]; e++)
+                    if (seen.Add(g.Head[e])) ball.Add(g.Head[e]);
+            var pocket = new List<int>();
+            foreach (int v in ball)
+                for (int e = g.OutStart[v]; e < g.OutStart[v + 1]; e++) pocket.Add(e);
+            ImportedCity.ClusterChangedEdges(g, pocket, out int pComp, out int pLargest, out float pShare);
+            Check(pComp <= 3, $"pocket read as {pComp} components (expected ~1)");
+            Check(pShare > 0.9f, $"pocket clustered share {pShare:P0} (expected >90%)");
+            Check(pLargest >= pocket.Count / 2, "pocket largest component implausibly small");
+
+            // scattered: far-apart single edges -> many singleton components
+            var scattered = new List<int>();
+            var usedNodes = new HashSet<int>();
+            while (scattered.Count < 40)
+            {
+                int e = rng.NextInt(g.EdgeCount);
+                if (!usedNodes.Add(g.Tail[e]) || !usedNodes.Add(g.Head[e])) continue;
+                scattered.Add(e);
+            }
+            ImportedCity.ClusterChangedEdges(g, scattered, out int sComp, out _, out float sShare);
+            Check(sComp == scattered.Count, $"scattered read as {sComp} components (expected {scattered.Count})");
+            Check(sShare < 0.1f, $"scattered clustered share {sShare:P0} (expected ~0)");
         }
 
         private static void VerifyCacheV4(ulong seed)
