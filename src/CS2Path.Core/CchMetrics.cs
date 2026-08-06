@@ -152,6 +152,14 @@ namespace CS2Path.Core
                         BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, from, to, K, 0);
                         continue;
                     }
+                    // Contiguous chunks, NOT round-robin. Nodes within a level are
+                    // stored in ascending rank, and rank order correlates with
+                    // arc-block order, so contiguous chunks keep each thread on
+                    // its own stretch of the weight arrays. With K=16 an arc's
+                    // lanes are exactly one 64-byte cache line, so interleaving
+                    // threads across neighbouring arcs would make every write a
+                    // false-sharing event — the suspected cause of the 2-thread
+                    // regression measured before this was tuned.
                     int chunk = (count + threads - 1) / threads;
                     Parallel.For(0, threads, ti =>
                     {

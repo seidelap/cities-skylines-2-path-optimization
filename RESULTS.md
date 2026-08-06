@@ -58,6 +58,7 @@ Graph: **131,039 nodes / 482,554 directed lane-edges** (three road tiers, holes)
 | operation | time | §6 target |
 |---|---|---|
 | full customization, all 16 metrics | 531 ms | < 10 ms (Burst/SIMD budget) |
+| full customization, level-parallel thread scaling (331 levels, 4-core container) | 1t=929 ms (0.94×), 2t=1,004 ms (0.87×), **4t=748 ms (1.16×)** | see "Burst port" below — this decomposition does **not** scale here |
 | partial, 100 edges ±10% drift, scattered (live lanes) | median 92.38 ms, p99 218.56 ms (43,016 arcs) | < 1 ms |
 | partial, 150 edges ±10% drift, clustered (one congestion pocket) | median 6.92 ms, p99 15.24 ms (3,362 arcs) | < 1 ms |
 | partial, 1000 edges ±10% drift, scattered (live lanes) | median 500.60 ms, p99 533.74 ms (282,503 arcs) | — |
@@ -246,6 +247,78 @@ variance — the partitioner-independent movement cost also moved, so read the
 subsystem ratios, not the absolute wall-clock, as the structural signal.
 
 
+## Burst port: compatibility achieved, parallel speedup NOT demonstrated
+
+Every §6 absolute target that this repo misses was previously excused with
+"needs Burst". The compiler port is now real; the *parallel* half of the story
+is not, and the honest result is more useful than the hoped-for one.
+
+### What is done and checked
+
+`BurstKernels.cs` holds the hot loops as `static unsafe` pointer-only kernels.
+A raw pointer plus an explicit length is the only buffer representation common
+to C# arrays (pinned with `fixed`, out of game) and `NativeArray` (via
+`GetUnsafePtr`, in game), so **one implementation compiles under both
+toolchains** and `CS2Path.Core` keeps its zero-game-reference rule (plan §5).
+`System.Numerics.Vector<float>`, invisible to Burst, is gone.
+
+Two properties are *checked*, not asserted:
+
+| property | how |
+|---|---|
+| parallel ≡ sequential, **bit-identical** | exact `SingleToInt32Bits` comparison at 2/3/4/8 threads; min is order-independent and adds no rounding, so a tolerance would have hidden bugs |
+| kernels are Burst-legal | a linter in the verify suite rejects managed collections, allocation, exceptions, `foreach`, .NET SIMD, non-static classes — and asserts `CchMetrics` actually routes through the kernels rather than keeping a drifting copy |
+
+`FloatMode.Strict` is pinned in the in-game job wrappers deliberately: Burst's
+default fast-math permits reassociation and FMA contraction, which would move
+results by an ulp and silently invalidate the certificate lower bounds, the
+200/200 Dijkstra agreement, and the bit-identity test above.
+
+### What did NOT work, and why
+
+Level-parallel customization was supposed to be the payoff. Measured on the
+4-core container, against 871 ms sequential:
+
+| threads | time | vs sequential |
+|---|---|---|
+| 1 | 929 ms | 0.94× |
+| 2 | 1,004 ms | **0.87×** |
+| 4 | 748 ms | 1.16× |
+
+**The curve is non-monotonic**, which rules out a clean bandwidth ceiling and
+points at contention. Three contributing causes, in order of confidence:
+
+1. **False sharing, structurally.** The layout is arc-major with K=16 lanes, so
+   one arc's weights are `16 × 4 B = exactly one 64-byte cache line`. Two
+   threads working adjacent arcs contend on the same line even when they touch
+   no common data. That 2-thread regression is the signature.
+2. **Level ordering costs locality.** Even at 1 thread the parallel path is 6%
+   slower than the sequential sweep, because it visits nodes in level order
+   while the sequential sweep visits in rank order, which matches the arc
+   layout.
+3. **Wrong axis for where the work is.** Road-network elimination trees are wide
+   and cheap at the leaves but narrow and expensive at the top separators — 331
+   levels averaging ~396 nodes. Node-parallelism is weakest exactly where the
+   cost concentrates.
+
+Two earlier defects were found and fixed along the way (a first cut ran at
+0.8×): `ContractLevelRange` forced the atomic path even on levels executed
+serially, and the atomic relax CAS'd unconditionally instead of testing for an
+improvement first.
+
+### Honest status
+
+**Burst compatibility: delivered and enforced.** **Parallel speedup: not
+demonstrated on this hardware** — 1.16× at 4 cores, non-monotonic, and the
+sequential path remains the default (`FullCustomizeParallel` is opt-in).
+
+This does not transfer as a negative result to the game: CS2 machines have
+8–16 cores, and Unity's job system schedules far more cheaply than
+`Parallel.For` per level. But that is a hypothesis, and it is not evidence.
+The measured lever that would help regardless is **layout**: padding or
+re-blocking so an arc's lanes do not alias a single cache line addresses cause
+(1) directly, and is worth trying before adding threads.
+
 ## A1 answered on REAL road networks (not the synthetic city)
 
 The single biggest architectural risk was A1 — **do real road networks have the
@@ -324,7 +397,7 @@ game. `harness import` already reports it whenever a demand trace is present
 |---|---|---|
 | point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **169–360 µs p99, 112–203× vs Dijkstra** across the real-morphology sweep (Ruhr 134k: 87 µs median / 169 µs p99; greater Paris 202k: 216/360 µs; NY 264k: 132/273 µs) with Inertial Flow separators | architectural claim now holds on real maps at synthetic-benchmark levels; the absolute 20 µs still needs Burst-class constant factors |
 | point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 174 µs p99 (94.5 µs median), 122× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; remaining gap to the absolute target is Burst-class constant factors |
-| full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques) | miss on absolute; the sweep is SIMD-lane-parallel and level-parallelizable — Burst-class headroom is large but this target is at risk and should be re-measured in-game |
+| full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques). Level-parallel gives only **1.16× at 4 cores and is non-monotonic** (see the Burst-port section) | **miss, and the headroom claim is now weaker than previously stated**: the sweep is Burst-legal and bit-identical under parallelism, but thread-parallelism did not deliver here — false sharing on the 64-byte arc-major lane block is the leading suspect. Layout work, not more threads, is the next lever |
 | typical partial customization < 1 ms | 6.9 ms median for a clustered congestion pocket (3,362 of 1.7M arcs — 0.2%); scattered random edges 92 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 6.5× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
 | oscillation amplitude reduced ≥ 5× | **5.9×** vs the oscillating vanilla regime (fast signal, re-measured under the flow partitioner); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |
