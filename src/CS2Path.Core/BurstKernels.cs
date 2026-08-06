@@ -226,26 +226,5 @@ namespace CS2Path.Core
             return changed;
         }
 
-        /// <summary>
-        /// Relax one upward chain step for a single lane — the innermost work of
-        /// an elimination-tree query. Returns the improved label.
-        /// </summary>
-        public static float RelaxUpward(
-            float* w, int* upStart, int* upHead, float* dist, int* stamp, int* pred,
-            int v, int stampNow, float dv, int K, int k)
-        {
-            for (int i = upStart[v]; i < upStart[v + 1]; i++)
-            {
-                int h = upHead[i];
-                float nd = dv + w[i * K + k];
-                if (stamp[h] != stampNow || nd < dist[h])
-                {
-                    stamp[h] = stampNow;
-                    dist[h] = nd;
-                    pred[h] = v;
-                }
-            }
-            return dv;
-        }
     }
 }
