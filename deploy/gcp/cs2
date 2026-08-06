@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# cs2 — drive the cloud workstation from your Mac.
+#
+#   cs2 up          start the VM (this is the only command that costs real money)
+#   cs2 down        stop it       (compute -> $0; disks keep billing)
+#   cs2 status      state, uptime, rough spend for the current session
+#   cs2 hibernate   snapshot the game disk and delete the VM + disks  (cheapest idle)
+#   cs2 wake        rebuild from the newest snapshot
+#   cs2 rdp         mint a Windows password for first-time setup
+#   cs2 pull NAME   download a city export from the bucket
+#   cs2 share NAME  signed URL for a city export (to hand to a tool/session)
+#   cs2 logs        tail the VM's bootstrap log
+#
+# Everything here runs against YOUR authenticated gcloud. Nothing in this repo
+# ever holds your credentials.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+TFVARS="${TFVARS:-terraform.tfvars}"
+tfvar() { grep -E "^\s*$1\s*=" "$TFVARS" 2>/dev/null | head -1 | sed -E 's/.*=\s*"?([^"]*)"?\s*$/\1/'; }
+
+PROJECT="$(tfvar project_id)"
+ZONE="$(tfvar zone)"; ZONE="${ZONE:-us-central1-a}"
+NAME="cs2-workstation"
+DISK="cs2-workstation-data"
+BUCKET="${PROJECT}-cs2-exports"
+# Rough all-in rate for g2-standard-8 + Windows licence + vWS. VERIFY against the
+# GCP pricing calculator for your region; this is only used for the nudge in `status`.
+RATE_PER_HOUR="${RATE_PER_HOUR:-1.40}"
+
+need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
+need gcloud
+[[ -n "$PROJECT" ]] || { echo "set project_id in $TFVARS" >&2; exit 1; }
+G=(gcloud --project "$PROJECT")
+
+# The billing-budget resource is read through billingbudgets.googleapis.com,
+# which REJECTS a plain user credential unless a quota project is attached.
+# Without these two, `terraform destroy` fails during the refresh phase and
+# tears down NOTHING while still exiting in a way that reads like progress —
+# i.e. you keep paying for disks you believe are gone. Verified the hard way.
+# Always confirm a teardown against `gcloud compute disks list`, not Terraform.
+export USER_PROJECT_OVERRIDE=true
+export GOOGLE_BILLING_PROJECT="$PROJECT"
+
+state() { "${G[@]}" compute instances describe "$NAME" --zone "$ZONE" --format='value(status)' 2>/dev/null || echo ABSENT; }
+
+case "${1:-help}" in
+
+up)
+  s=$(state)
+  [[ "$s" == "ABSENT" ]] && { echo "No VM. Run 'terraform apply' first, or 'cs2 wake' if hibernated."; exit 1; }
+  if [[ "$s" != "RUNNING" ]]; then
+    echo "Starting $NAME ..."
+    "${G[@]}" compute instances start "$NAME" --zone "$ZONE" >/dev/null
+  fi
+  ip=$("${G[@]}" compute instances describe "$NAME" --zone "$ZONE" \
+        --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+  echo "RUNNING at $ip"
+  echo
+  echo "Connect with Parsec (recommended) or RDP to $ip:3389 for setup."
+  echo "The VM shuts itself down when idle, and hard-stops at the session cap."
+  ;;
+
+down)
+  echo "Stopping $NAME ..."
+  "${G[@]}" compute instances stop "$NAME" --zone "$ZONE" >/dev/null
+  echo "Stopped. Compute billing has ceased; disks continue to bill."
+  echo "Not playing for a few weeks? 'cs2 hibernate' drops that to roughly snapshot cost."
+  ;;
+
+status)
+  s=$(state)
+  echo "instance : $NAME ($s)"
+  if [[ "$s" == "RUNNING" ]]; then
+    started=$("${G[@]}" compute instances describe "$NAME" --zone "$ZONE" --format='value(lastStartTimestamp)')
+    ip=$("${G[@]}" compute instances describe "$NAME" --zone "$ZONE" \
+          --format='value(networkInterfaces[0].accessConfigs[0].natIP)')
+    if command -v python3 >/dev/null; then
+      hours=$(python3 - "$started" <<'PY'
+import sys, datetime
+t = sys.argv[1].replace('Z', '+00:00')
+d = datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(t)
+print(f"{d.total_seconds()/3600:.2f}")
+PY
+)
+      cost=$(python3 -c "print(f'{float('$hours')*float('$RATE_PER_HOUR'):.2f}')")
+      echo "ip       : $ip"
+      echo "uptime   : ${hours}h  (~\$${cost} this session at \$${RATE_PER_HOUR}/h)"
+    fi
+  fi
+  echo "disks    :"
+  "${G[@]}" compute disks list --filter="name~cs2-workstation" \
+      --format='table(name,sizeGb,type.basename(),zone.basename())' 2>/dev/null || true
+  echo "snapshots:"
+  "${G[@]}" compute snapshots list --filter="name~cs2-data" \
+      --format='table(name,diskSizeGb,storageBytes,creationTimestamp)' 2>/dev/null || true
+  ;;
+
+hibernate)
+  s=$(state)
+  [[ "$s" == "RUNNING" ]] && { echo "Stopping first ..."; "${G[@]}" compute instances stop "$NAME" --zone "$ZONE" >/dev/null; }
+  snap="cs2-data-$(date +%Y%m%d-%H%M%S)"
+  echo "Snapshotting game disk -> $snap (this preserves Steam, CS2, saves and the repo) ..."
+  "${G[@]}" compute disks snapshot "$DISK" --zone "$ZONE" --snapshot-names "$snap" >/dev/null
+  echo "Snapshot done. Destroying VM and disks ..."
+  terraform destroy -target=google_compute_instance.vm -target=google_compute_disk.data -auto-approve
+  echo
+  echo "Hibernated. Only the snapshot and bucket bill now."
+  echo "Bring it back with: cs2 wake"
+  ;;
+
+wake)
+  snap=$("${G[@]}" compute snapshots list --filter="name~cs2-data" \
+          --sort-by=~creationTimestamp --limit=1 --format='value(name)')
+  [[ -n "$snap" ]] || { echo "No snapshot found — nothing to wake." >&2; exit 1; }
+  echo "Restoring from $snap (takes a few minutes) ..."
+  terraform apply -auto-approve -var "data_disk_source_snapshot=$snap"
+  echo "Restored. 'cs2 up' when you want to play."
+  ;;
+
+rdp)
+  echo "Minting a Windows password (needed once, for the Steam + Parsec logins):"
+  "${G[@]}" compute reset-windows-password "$NAME" --zone "$ZONE" --user cs2
+  ;;
+
+pull)
+  obj="${2:?usage: cs2 pull <object-name>}"
+  gcloud --project "$PROJECT" storage cp "gs://$BUCKET/$obj" .
+  echo "Downloaded ./$obj"
+  echo "Replay it:  dotnet run -c Release --project src/CS2Path.Harness -- import --file $obj"
+  ;;
+
+share)
+  obj="${2:?usage: cs2 share <object-name>}"
+  echo "Signed URL (1h). Requires roles/iam.serviceAccountTokenCreator on the VM service account:"
+  gcloud --project "$PROJECT" storage sign-url "gs://$BUCKET/$obj" \
+      --duration=1h --impersonate-service-account="cs2-workstation-sa@${PROJECT}.iam.gserviceaccount.com"
+  ;;
+
+logs)
+  "${G[@]}" compute instances get-serial-port-output "$NAME" --zone "$ZONE" | tail -60
+  ;;
+
+*)
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  ;;
+esac

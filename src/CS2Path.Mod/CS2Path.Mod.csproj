@@ -1,0 +1,69 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Game-facing adapter (plan §5). This project holds the ONLY classes allowed
+       to touch Colossal Order code: the reader adapter (ECS -> IGraphSource /
+       IMetricFeed / IWorldEvents), the writer adapter (PlanPortfolio ->
+       PathOwner / CarNavigation), and the city exporter.
+
+       Two build modes:
+         * default (this repo, CI, any machine): OUT_OF_GAME_BUILD — game
+           touchpoints compile as documented stubs, so the seam stays type-checked
+           without the non-redistributable game assemblies.
+         * in-game:  dotnet build -p:InGame=true -p:GameManagedDir="<...>\Cities2_Data\Managed"
+           references the installed game's managed assemblies. Run this ON the
+           machine that has CS2 installed (see deploy/gcp). -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <InGame Condition="'$(InGame)' == ''">false</InGame>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(InGame)' != 'true'">
+    <DefineConstants>$(DefineConstants);OUT_OF_GAME_BUILD</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../CS2Path.Core/CS2Path.Core.csproj" />
+  </ItemGroup>
+
+  <!-- In-game only. Uses Colossal Order's OFFICIAL modding toolchain rather than
+       hand-rolled HintPaths into Cities2_Data\Managed: the toolchain's Mod.props /
+       Mod.targets resolve the game + Unity assemblies AND handle mod packaging and
+       deployment to the local Mods folder. CSII_TOOLPATH is a user environment
+       variable set when you install the modding toolchain from inside the game
+       (Options -> Modding). This is the pattern shipped CS2 mods use — verified
+       against krzychu124/Traffic's Traffic.csproj.
+
+       The referenced assemblies are never redistributed and never committed; they
+       exist only on a machine that owns the game. -->
+  <PropertyGroup Condition="'$(InGame)' == 'true'">
+    <CSIIToolPath>$([System.Environment]::GetEnvironmentVariable('CSII_TOOLPATH', 'EnvironmentVariableTarget.User'))</CSIIToolPath>
+  </PropertyGroup>
+
+  <Import Project="$(CSIIToolPath)\Mod.props"
+          Condition="'$(InGame)' == 'true' AND Exists('$(CSIIToolPath)\Mod.props')" />
+
+  <ItemGroup Condition="'$(InGame)' == 'true'">
+    <!-- Resolved by Mod.props; no HintPath needed. -->
+    <Reference Include="Game" Private="false" />
+    <Reference Include="Colossal.Core" Private="false" />
+    <Reference Include="Colossal.Logging" Private="false" />
+    <Reference Include="Colossal.Mathematics" Private="false" />
+    <Reference Include="Unity.Entities" Private="false" />
+    <Reference Include="Unity.Collections" Private="false" />
+    <Reference Include="Unity.Mathematics" Private="false" />
+    <Reference Include="Unity.Burst" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" Private="false" />
+  </ItemGroup>
+
+  <Import Project="$(CSIIToolPath)\Mod.targets"
+          Condition="'$(InGame)' == 'true' AND Exists('$(CSIIToolPath)\Mod.targets')" />
+
+  <Target Name="CheckToolchain" BeforeTargets="Build" Condition="'$(InGame)' == 'true'">
+    <Error Condition="'$(CSIIToolPath)' == '' OR !Exists('$(CSIIToolPath)\Mod.props')"
+           Text="InGame=true requires the official CS2 modding toolchain. Install it from inside the game (Options -&gt; Modding); it sets the CSII_TOOLPATH user environment variable. Current value: '$(CSIIToolPath)'." />
+  </Target>
+
+</Project>

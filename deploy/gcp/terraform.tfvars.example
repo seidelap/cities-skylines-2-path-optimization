@@ -1,0 +1,20 @@
+project_id = "my-cs2-project"
+zone       = "us-central1-a"
+region     = "us-central1"
+
+# curl -s ifconfig.me   -> then append /32
+my_ip_cidr = "203.0.113.7/32"
+
+# g2-standard-8 (L4) is the recommended default. For the cheaper/slower path:
+#   machine_type = "n1-standard-8"
+#   gpu_type     = "nvidia-tesla-t4-vws"
+machine_type = "g2-standard-8"
+gpu_type     = ""
+
+# Cost guards. max_session_hours is the one that matters — do not set it to 0.
+idle_shutdown_minutes = 20
+max_session_hours     = 6
+
+# Optional budget alert (find it with: gcloud billing accounts list)
+# billing_account    = "01ABCD-2345EF-6789AB"
+# monthly_budget_usd = 75

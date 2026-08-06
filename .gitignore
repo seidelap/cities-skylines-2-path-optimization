@@ -1,0 +1,12 @@
+bin/
+obj/
+*.user
+.vs/
+
+# Terraform working files (provider binaries, state, and any *.tfvars that
+# would carry your IP or billing account into git)
+deploy/gcp/.terraform/
+deploy/gcp/*.tfstate
+deploy/gcp/*.tfstate.*
+deploy/gcp/*.tfvars
+deploy/gcp/tfplan
