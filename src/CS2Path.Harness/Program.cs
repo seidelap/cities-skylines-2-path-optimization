@@ -279,19 +279,32 @@ namespace CS2Path.Harness
             // becomes one IJobParallelFor per level and additionally gets
             // Burst's vectorizer, so this ratio is a floor on the in-game win,
             // not an estimate of it.
-            var parMs = new List<double>();
-            for (int rep = 0; rep < 3; rep++)
+            // Thread scaling, not just a single parallel number: if the sweep is
+            // memory-bandwidth-bound rather than compute-bound, time flattens
+            // early and no decomposition will fix it. That distinction decides
+            // whether the remaining in-game win comes from more threads or from
+            // Burst's codegen and tighter data layout, so it is worth measuring
+            // rather than assuming.
+            var scaling = new List<(int t, double ms)>();
+            foreach (int t in new[] { 1, 2, 4, Environment.ProcessorCount })
             {
-                eng.Metrics.ResetAll();
-                sw.Restart();
-                eng.Metrics.FullCustomizeParallel();
-                parMs.Add(sw.Elapsed.TotalMilliseconds);
+                if (scaling.Exists(s => s.t == t)) continue;
+                var reps = new List<double>();
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    eng.Metrics.ResetAll();
+                    sw.Restart();
+                    eng.Metrics.FullCustomizeParallel(t);
+                    reps.Add(sw.Elapsed.TotalMilliseconds);
+                }
+                reps.Sort();
+                scaling.Add((t, reps[reps.Count / 2]));
             }
-            parMs.Sort();
-            double fullParMs = parMs[parMs.Count / 2];
-            Console.WriteLine($"  full customize: sequential {fullMs:N0} ms -> level-parallel {fullParMs:N0} ms " +
-                              $"({fullMs / Math.Max(0.001, fullParMs):0.0}x on {Environment.ProcessorCount} cores, " +
-                              $"{eng.Skeleton.LevelCount} levels)");
+            double fullParMs = scaling[scaling.Count - 1].ms;
+            string scalingStr = string.Join(", ", scaling.ConvertAll(s =>
+                $"{s.t}t={s.ms:N0}ms({fullMs / Math.Max(0.001, s.ms):0.00}x)"));
+            Console.WriteLine($"  full customize: sequential {fullMs:N0} ms | level-parallel {scalingStr} " +
+                              $"| {eng.Skeleton.LevelCount} levels, {Environment.ProcessorCount} cores");
             // Leave the engine in the canonical sequential state for everything
             // that follows, so no later measurement inherits the parallel run.
             eng.Metrics.ResetAll();
@@ -369,7 +382,7 @@ namespace CS2Path.Harness
             sb.AppendLine("| operation | time | §6 target |");
             sb.AppendLine("|---|---|---|");
             sb.AppendLine($"| full customization, all {K} metrics (sequential) | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
-            sb.AppendLine($"| full customization, level-parallel ({Environment.ProcessorCount} cores, {eng.Skeleton.LevelCount} levels) | **{fullParMs:N0} ms** ({fullMs / Math.Max(0.001, fullParMs):0.0}× ) | same kernel; in-game adds Burst codegen on top |");
+            sb.AppendLine($"| full customization, level-parallel thread scaling ({eng.Skeleton.LevelCount} levels) | {scalingStr} | flattening ⇒ bandwidth-bound, not thread-starved |");
             sb.AppendLine($"| partial, 100 edges ±10% drift, scattered (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / Rounds:N0} arcs) | < 1 ms |");
             sb.AppendLine($"| partial, 150 edges ±10% drift, clustered (one congestion pocket) | median {Pct(partialClustered, 0.5):0.00} ms, p99 {Pct(partialClustered, 0.99):0.00} ms ({arcsClustered / Rounds:N0} arcs) | < 1 ms |");
             sb.AppendLine($"| partial, 1000 edges ±10% drift, scattered (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / Rounds:N0} arcs) | — |");
