@@ -11,6 +11,15 @@ speed collapses with pending pathfinding queries, and why corridors herd and osc
 rebuild moves the work to preprocessing: **structure once, metrics per traffic refresh,
 queries in microseconds** — and makes change propagation, not recomputation, the default.
 
+A companion project is designed in
+[`cs2-spatial-demand-economy.md`](cs2-spatial-demand-economy.md): a spatially
+disaggregated replacement for CS2's demand, migration, land-value, rent,
+leveling, and trade-pricing systems under Georgist land accounting, consuming
+this rebuild's CCH/cluster infrastructure. Its modding-surface survey —
+systems to replace, component touchpoints, the new-views/UI workload, and
+save-state requirements — is in
+[`cs2-spatial-demand-economy-implementation.md`](cs2-spatial-demand-economy-implementation.md).
+
 ## Layout
 
 ```
