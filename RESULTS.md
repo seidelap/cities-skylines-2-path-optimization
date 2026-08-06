@@ -58,7 +58,8 @@ Graph: **131,039 nodes / 482,554 directed lane-edges** (three road tiers, holes)
 | operation | time | §6 target |
 |---|---|---|
 | full customization, all 16 metrics | 531 ms | < 10 ms (Burst/SIMD budget) |
-| full customization, level-parallel thread scaling (331 levels, 4-core container) | 1t=929 ms (0.94×), 2t=1,004 ms (0.87×), **4t=748 ms (1.16×)** | see "Burst port" below — this decomposition does **not** scale here |
+| full customization split: seeding vs sweep | ResetAll 190 ms (21%) + triangle sweep 717 ms (79%), sweep stable to ±0.7% | the ported half is the dominant half |
+| full customization, level-parallel thread scaling (331 levels, 4-core container) | 1t=940 ms (0.98×), 2t=1,024 ms (0.90×), **4t=737 ms (1.26×)** | see "Burst port" below — this decomposition does **not** scale here |
 | partial, 100 edges ±10% drift, scattered (live lanes) | median 92.38 ms, p99 218.56 ms (43,016 arcs) | < 1 ms |
 | partial, 150 edges ±10% drift, clustered (one congestion pocket) | median 6.92 ms, p99 15.24 ms (3,362 arcs) | < 1 ms |
 | partial, 1000 edges ±10% drift, scattered (live lanes) | median 500.60 ms, p99 533.74 ms (282,503 arcs) | — |
@@ -274,6 +275,33 @@ default fast-math permits reassociation and FMA contraction, which would move
 results by an ulp and silently invalidate the certificate lower bounds, the
 200/200 Dijkstra agreement, and the bit-identity test above.
 
+### Where the time actually goes (measured, after fixing the instrument)
+
+Customization is two passes with different bottlenecks, and reporting them as
+one number hid which was which. Split, 5 reps each at 131k nodes:
+
+| pass | median | share | ported to kernels? |
+|---|---|---|---|
+| `ResetAll` — seed every arc lane from its original edge weight | 190 ms (177–198) | **21%** | no |
+| triangle sweep — the min-plus elimination pass | **717 ms** (714–724) | **79%** | yes |
+
+An adversarial audit predicted the seeding pass was "almost certainly the
+larger half". It is 21%. The port targeted the right pass, but for the wrong
+stated reason — worth recording, because the same audit's other structural
+findings were correct and it would be easy to accept all of them uniformly.
+
+**Instrument note.** The sweep now measures to ±0.7% across reps. Earlier
+conclusions in this section were drawn partly from `RoutingEngine.customize`,
+which is a single *cold* run and swings **50% on identical code** (1,380–2,073
+ms). Only warm, repeated measurements can resolve changes of the size being
+attempted here. One claim was retracted on that basis: hoisting the per-lane
+integer divide out of `EdgeWeight` was described as the biggest available win
+and in fact moved nothing measurable — the seeding pass is memory-latency-bound
+on scattered edge lookups, so a ~20-cycle divide hides behind the cache misses
+it waits on. That change was kept for a different and real reason: the
+descriptor table is blittable, which is what makes the seeding pass portable to
+Burst at all.
+
 ### What did NOT work, and why
 
 Level-parallel customization was supposed to be the payoff. Measured on the
@@ -315,9 +343,17 @@ sequential path remains the default (`FullCustomizeParallel` is opt-in).
 This does not transfer as a negative result to the game: CS2 machines have
 8–16 cores, and Unity's job system schedules far more cheaply than
 `Parallel.For` per level. But that is a hypothesis, and it is not evidence.
-The measured lever that would help regardless is **layout**: padding or
-re-blocking so an arc's lanes do not alias a single cache line addresses cause
-(1) directly, and is worth trying before adding threads.
+
+**The next lever, now testable.** With the sweep resolving to ±0.7%, the
+false-sharing hypothesis is finally falsifiable. The fix is alignment, not
+padding: managed arrays are 8-byte aligned, so an arc's 16 lanes (64 B)
+generally *straddle two* cache lines rather than occupying one. Moving `WFwd`/
+`WBwd` to 64-byte-aligned unmanaged allocations would put each arc's block on
+exactly one line — and would move the buffers closer to `NativeArray`
+semantics, which the in-game path wants anyway. If that does not restore
+scaling, node-level parallelism is the wrong axis here and the honest
+conclusion is that customization throughput must come from Burst codegen
+rather than from threads.
 
 ## A1 answered on REAL road networks (not the synthetic city)
 
@@ -397,7 +433,7 @@ game. `harness import` already reports it whenever a demand trace is present
 |---|---|---|
 | point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **169–360 µs p99, 112–203× vs Dijkstra** across the real-morphology sweep (Ruhr 134k: 87 µs median / 169 µs p99; greater Paris 202k: 216/360 µs; NY 264k: 132/273 µs) with Inertial Flow separators | architectural claim now holds on real maps at synthetic-benchmark levels; the absolute 20 µs still needs Burst-class constant factors |
 | point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 174 µs p99 (94.5 µs median), 122× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; remaining gap to the absolute target is Burst-class constant factors |
-| full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques). Level-parallel gives only **1.16× at 4 cores and is non-monotonic** (see the Burst-port section) | **miss, and the headroom claim is now weaker than previously stated**: the sweep is Burst-legal and bit-identical under parallelism, but thread-parallelism did not deliver here — false sharing on the 64-byte arc-major lane block is the leading suspect. Layout work, not more threads, is the next lever |
+| full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques). Split: seeding 190 ms (21%) + triangle sweep 717 ms (79%). Level-parallel gives only **1.26× at 4 cores and is non-monotonic** (see the Burst-port section) | **miss, and the headroom claim is weaker than previously stated**: the sweep is Burst-legal and bit-identical under parallelism, but thread-parallelism did not deliver here. Leading suspect is 8-byte-aligned managed arrays making each arc's 64-byte lane block straddle two cache lines. Alignment work, not more threads, is the next lever — and the sweep now measures to ±0.7%, so it is finally falsifiable |
 | typical partial customization < 1 ms | 6.9 ms median for a clustered congestion pocket (3,362 of 1.7M arcs — 0.2%); scattered random edges 92 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 6.5× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
 | oscillation amplitude reduced ≥ 5× | **5.9×** vs the oscillating vanilla regime (fast signal, re-measured under the flow partitioner); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |
