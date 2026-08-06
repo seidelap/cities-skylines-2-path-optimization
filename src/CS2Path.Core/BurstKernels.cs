@@ -92,10 +92,16 @@ namespace CS2Path.Core
         {
             for (int k = 0; k < K; k++)
             {
+                // Plain read-and-compare BEFORE attempting any CAS. Most
+                // relaxations do not improve the target, and an unconditional
+                // CAS on every lane measured slower than the whole sequential
+                // sweep. A stale read here is safe: it can only be too
+                // pessimistic (another thread lowered the slot meanwhile), and
+                // AtomicMin re-validates under the CAS anyway.
                 float f = wBwd[b1 + k] + wFwd[b2 + k];
-                AtomicMin(wFwd + bt + k, f);
+                if (f < wFwd[bt + k]) AtomicMin(wFwd + bt + k, f);
                 float b = wBwd[b2 + k] + wFwd[b1 + k];
-                AtomicMin(wBwd + bt + k, b);
+                if (b < wBwd[bt + k]) AtomicMin(wBwd + bt + k, b);
             }
         }
 
@@ -168,13 +174,21 @@ namespace CS2Path.Core
         /// levelNodes[from..to). Callers must complete a level before starting the
         /// next; within a level, order is irrelevant (see RelaxTriangleAtomic).
         /// In-game this is the Execute body of an IJobParallelFor.
+        ///
+        /// atomic MUST be 1 whenever another thread is working the same level
+        /// concurrently, and SHOULD be 0 when this range is the whole level and
+        /// is being run by one thread. Road-network elimination trees are deep
+        /// and narrow — 331 levels averaging ~400 nodes at 131k — so most levels
+        /// are executed serially, and forcing the atomic path on them paid CAS
+        /// cost for parallelism that was never happening. That alone made the
+        /// first parallel implementation SLOWER than sequential (0.8x).
         /// </summary>
         public static void ContractLevelRange(
             float* wFwd, float* wBwd, int* upStart, int* upHead, int* levelNodes,
-            int from, int to, int K)
+            int from, int to, int K, byte atomic)
         {
             for (int i = from; i < to; i++)
-                ContractNode(wFwd, wBwd, upStart, upHead, levelNodes[i], K, 1);
+                ContractNode(wFwd, wBwd, upStart, upHead, levelNodes[i], K, atomic);
         }
 
         /// <summary>

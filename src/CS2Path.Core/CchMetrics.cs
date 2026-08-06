@@ -127,8 +127,13 @@ namespace CS2Path.Core
             ChangeEpoch++;
             Array.Fill(NodeArcChangeEpoch, ChangeEpoch);
             if (threads <= 0) threads = Environment.ProcessorCount;
-            // Below this, thread dispatch costs more than the level saves.
-            const int MinNodesToSplit = 512;
+            // Below this, thread dispatch costs more than splitting the level
+            // saves. Measured: at 131k nodes the tree has 331 levels averaging
+            // ~400 nodes, so a threshold of 512 sent nearly every level down the
+            // serial path — and the serial path was still paying atomic-CAS cost,
+            // which is why the first cut of this ran at 0.8x sequential. Levels
+            // below the threshold now run the plain non-atomic kernel.
+            const int MinNodesToSplit = 96;
 
             fixed (float* wf = WFwd, wb = WBwd)
             fixed (int* upStart = c.UpStart, upHead = c.UpHead, levelNodes = c.LevelNodes)
@@ -142,7 +147,9 @@ namespace CS2Path.Core
                     if (count <= 0) continue;
                     if (count < MinNodesToSplit || threads == 1)
                     {
-                        BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, from, to, K);
+                        // Single-threaded over the whole level => no concurrent
+                        // writer => the fast non-atomic, vectorizable kernel.
+                        BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, from, to, K, 0);
                         continue;
                     }
                     int chunk = (count + threads - 1) / threads;
@@ -151,7 +158,7 @@ namespace CS2Path.Core
                         int lo = from + ti * chunk;
                         int hi = Math.Min(to, lo + chunk);
                         if (lo < hi)
-                            BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, lo, hi, K);
+                            BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, lo, hi, K, 1);
                     });
                 }
             }
