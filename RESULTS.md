@@ -21,7 +21,7 @@ Where a target is missed even accounting for that, it is called out honestly.
 | §2(d) joint destination+route choice | bucket scans return (destination, route) menus in ~150 µs, verified exact vs brute force |
 | §2(e) closures graded and metered | hard closures exact in every scenario (verified round-trip); soft closures graded with hysteresis; event wakes metered upstream-first |
 
-## Correctness verification (48 checks, all passing)
+## Correctness verification (72 checks, all passing)
 
 CCH distances ≡ Dijkstra across every anchor metric (city + random graphs, BFS-fallback
 order); partial customization ≡ full recustomization; hard-closure + reopen round-trips

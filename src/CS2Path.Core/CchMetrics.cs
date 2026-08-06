@@ -26,6 +26,16 @@ namespace CS2Path.Core
 
         public long LastPartialArcsRecomputed; // telemetry
 
+        /// <summary>Levels narrower than this run serially (dispatch would cost
+        /// more than the split saves). Public so the bit-identity test can assert
+        /// the parallel path was actually EXERCISED — if every level of the test
+        /// graph fell below this, the test would be silently vacuous.</summary>
+        public const int MinLevelNodesToSplit = 96;
+
+        /// <summary>Levels that actually ran multi-threaded in the last
+        /// FullCustomizeParallel call. Zero means the run was serial throughout.</summary>
+        public int LastParallelLevelsSplit;
+
         /// <summary>Monotonic epoch, bumped per (partial) customization. Together
         /// with NodeArcChangeEpoch this is the "dirty flag" consumers use to
         /// event-drive their own refreshes (Layer 3 buckets): a backward search
@@ -127,13 +137,14 @@ namespace CS2Path.Core
             ChangeEpoch++;
             Array.Fill(NodeArcChangeEpoch, ChangeEpoch);
             if (threads <= 0) threads = Environment.ProcessorCount;
+            LastParallelLevelsSplit = 0;
             // Below this, thread dispatch costs more than splitting the level
             // saves. Measured: at 131k nodes the tree has 331 levels averaging
             // ~400 nodes, so a threshold of 512 sent nearly every level down the
             // serial path — and the serial path was still paying atomic-CAS cost,
             // which is why the first cut of this ran at 0.8x sequential. Levels
             // below the threshold now run the plain non-atomic kernel.
-            const int MinNodesToSplit = 96;
+            const int MinNodesToSplit = MinLevelNodesToSplit;
 
             fixed (float* wf = WFwd, wb = WBwd)
             fixed (int* upStart = c.UpStart, upHead = c.UpHead, levelNodes = c.LevelNodes)
@@ -160,6 +171,7 @@ namespace CS2Path.Core
                     // threads across neighbouring arcs would make every write a
                     // false-sharing event — the suspected cause of the 2-thread
                     // regression measured before this was tuned.
+                    LastParallelLevelsSplit++;
                     int chunk = (count + threads - 1) / threads;
                     Parallel.For(0, threads, ti =>
                     {

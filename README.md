@@ -15,6 +15,9 @@ queries in microseconds** — and makes change propagation, not recomputation, t
 
 ```
 src/CS2Path.Core/      Pure routing core — NO game assembly references (plan §5)
+  BurstKernels.cs        The hot loops as static unsafe pointer-only kernels — ONE
+                         implementation that compiles under both Roslyn (harness)
+                         and Unity Burst (in-game), with no Unity types in Core
   NestedDissection.cs    Layer 0: metric-independent elimination order (Inertial Flow
                                   min-cut separators; geometric sweep on small cells)
   CchSkeleton.cs         Layer 0: contraction with ALL shortcuts (chordal supergraph)
@@ -139,6 +142,34 @@ demand) and A3 (partial-customization cost + clustering on real change sets).
 See [`deploy/gcp/SESSION-RUNBOOK.md`](deploy/gcp/SESSION-RUNBOOK.md) for the
 session that collects everything, including the frame-time share of vanilla
 pathfinding (the Amdahl ceiling).
+
+### Burst port: compatibility done, speedup not
+
+Every §6 absolute target this repo misses was previously excused with "needs
+Burst". The compiler port is real; the parallel payoff is not, and both halves
+are reported in [`RESULTS.md`](RESULTS.md).
+
+**Done and enforced.** `BurstKernels.cs` holds the hot loops as `static unsafe`
+pointer-only kernels. A pointer plus explicit length is the only buffer
+representation common to C# arrays (`fixed`) and `NativeArray`
+(`GetUnsafePtr`), so one implementation serves both toolchains and Core keeps
+its zero-game-reference rule. `System.Numerics.Vector<float>` — invisible to
+Burst — is gone. Two properties are *checked*, not asserted: parallel results
+are bit-identical to sequential at 2/3/4/8 threads (exact bit comparison, plus
+an assertion that the concurrent path actually engaged, so the test cannot pass
+vacuously), and a linter in the verify suite rejects managed constructs in the
+kernel file and confirms `CchMetrics` really routes through it.
+
+**Not done.** Level-parallel customization reaches only **1.26× on 4 cores**
+and the curve is non-monotonic (1t 0.98×, 2t 0.90×, 4t 1.26×). Leading suspect
+is false sharing: managed arrays are 8-byte aligned, so an arc's 16 lanes
+(64 B) straddle two cache lines. Sequential remains the default path.
+
+**One in-game detail that must not be "optimized" later:** the job wrappers pin
+`FloatMode.Strict`. Burst's default fast-math permits reassociation and FMA
+contraction, which would move results by an ulp and silently invalidate the
+certificate lower bounds, the 200/200 Dijkstra agreement, and the bit-identity
+test above.
 
 ### Modeling constraints (documented decisions, not code)
 

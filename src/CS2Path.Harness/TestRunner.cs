@@ -674,6 +674,13 @@ namespace CS2Path.Harness
                     if (BitConverter.SingleToInt32Bits(m.WBwd[i]) != BitConverter.SingleToInt32Bits(seqB[i])) mismatches++;
                 }
                 Check(mismatches == 0, $"parallel customization diverged from sequential on {mismatches} lanes at {threads} threads");
+                // Guard against a VACUOUS pass: if every level of this graph is
+                // narrower than MinLevelNodesToSplit, FullCustomizeParallel runs
+                // fully serially and "bit-identical" proves nothing about the
+                // atomic path. Assert the concurrent path actually executed.
+                Check(m.LastParallelLevelsSplit > 0,
+                    $"parallel path never engaged at {threads} threads — test graph has no level " +
+                    $"≥ {CchMetrics.MinLevelNodesToSplit} nodes, so bit-identity is vacuous");
             }
 
             // Levels must actually partition the nodes, or the sweep silently
