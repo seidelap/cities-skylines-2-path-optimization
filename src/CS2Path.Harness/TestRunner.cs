@@ -681,6 +681,15 @@ namespace CS2Path.Harness
                 Check(m.LastParallelLevelsSplit > 0,
                     $"parallel path never engaged at {threads} threads — test graph has no level " +
                     $"≥ {CchMetrics.MinLevelNodesToSplit} nodes, so bit-identity is vacuous");
+                // HONESTY LIMIT, measured by adversarial review: this guard shows
+                // the concurrent path RAN, not that any arc was CONTENDED. On
+                // this graph only ~6% of triangles land in splittable levels and
+                // just 6-118 arcs are written from different chunks, so a build
+                // with the atomic min deleted still passes ~199 runs in 200.
+                // Bit-identity here therefore demonstrates the LEVEL SCHEDULE is
+                // sound; it does NOT prove the atomic is necessary or correct.
+                // Contention is asserted separately below, where it can be
+                // counted deterministically rather than raced for.
             }
 
             // Levels must actually partition the nodes, or the sweep silently
@@ -707,6 +716,54 @@ namespace CS2Path.Harness
                 if (p >= 0 && lvlOf[p] <= lvlOf[v]) inversions++;
             }
             Check(inversions == 0, $"{inversions} elimination-tree edges do not increase level");
+
+            // THE INVARIANT THE PARALLEL SWEEP ACTUALLY DEPENDS ON, counted
+            // directly instead of raced for. Two claims:
+            //  (a) no arc READ by a level-L node is WRITTEN by a level-L node —
+            //      if this fails the schedule is unsound and no atomic can save
+            //      it, because a reader could see a half-updated input;
+            //  (b) some arc IS written by two different nodes of one level —
+            //      if this never happens the atomic min is dead weight, and any
+            //      bit-identity result says nothing about it.
+            var writerLevel = new int[c.ArcCount];
+            var writerNode = new int[c.ArcCount];
+            for (int i = 0; i < c.ArcCount; i++) { writerLevel[i] = -1; writerNode[i] = -1; }
+            int readWriteConflicts = 0, contendedArcs = 0;
+            for (int lvl = 0; lvl < c.LevelCount; lvl++)
+            {
+                for (int i = c.LevelStart[lvl]; i < c.LevelStart[lvl + 1]; i++)
+                {
+                    int x = c.LevelNodes[i];
+                    int s = c.UpStart[x], e = c.UpStart[x + 1];
+                    for (int p2 = s; p2 < e; p2++)
+                    {
+                        // (a) arcs (x, ·) are this node's INPUTS
+                        if (writerLevel[p2] == lvl) readWriteConflicts++;
+                    }
+                    for (int ii = s; ii < e; ii++)
+                    {
+                        int A = c.UpHead[ii];
+                        int p3 = s, q = c.UpStart[A], qe = c.UpStart[A + 1];
+                        while (p3 < e && q < qe)
+                        {
+                            int hb = c.UpHead[p3], hb2 = c.UpHead[q];
+                            if (hb < hb2) p3++;
+                            else if (hb > hb2) q++;
+                            else
+                            {
+                                if (writerLevel[q] == lvl && writerNode[q] != x) contendedArcs++;
+                                writerLevel[q] = lvl; writerNode[q] = x;
+                                p3++; q++;
+                            }
+                        }
+                    }
+                }
+            }
+            Check(readWriteConflicts == 0,
+                $"UNSOUND SCHEDULE: {readWriteConflicts} arcs are read and written within one level");
+            Check(contendedArcs > 0,
+                "no arc is written by two nodes of the same level on this graph — the atomic min is " +
+                "untested here, so bit-identity cannot be read as evidence for it");
         }
 
         private static void VerifyBurstKernelPortability()

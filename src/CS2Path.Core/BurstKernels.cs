@@ -90,14 +90,42 @@ namespace CS2Path.Core
         /// </summary>
         public static void RelaxTriangleAtomic(float* wFwd, float* wBwd, int b1, int b2, int bt, int K)
         {
-            for (int k = 0; k < K; k++)
+            // Measured: this path is ~2x slower per triangle than RelaxTriangle,
+            // and since ~95% of triangle work lands in splittable levels, that
+            // factor — NOT cache-line contention — is what caps level-parallel
+            // scaling. (Adversarial review established this directly: the same
+            // schedule and chunking with the atomic removed scales 1.98x at two
+            // threads, while 64-byte alignment moves it under 1%.)
+            //
+            // So the shape matters. The 4-wide block below mirrors the
+            // non-atomic kernel's form: compute four candidates, test all four
+            // with plain loads, and pay a CAS only on lanes that actually
+            // improve. A stale load is safe — it can only be pessimistic
+            // (another thread may have lowered the slot since), and AtomicMin
+            // re-validates under the compare-and-swap.
+            int k = 0;
+            for (; k <= K - 4; k += 4)
             {
-                // Plain read-and-compare BEFORE attempting any CAS. Most
-                // relaxations do not improve the target, and an unconditional
-                // CAS on every lane measured slower than the whole sequential
-                // sweep. A stale read here is safe: it can only be too
-                // pessimistic (another thread lowered the slot meanwhile), and
-                // AtomicMin re-validates under the CAS anyway.
+                float f0 = wBwd[b1 + k + 0] + wFwd[b2 + k + 0];
+                float f1 = wBwd[b1 + k + 1] + wFwd[b2 + k + 1];
+                float f2 = wBwd[b1 + k + 2] + wFwd[b2 + k + 2];
+                float f3 = wBwd[b1 + k + 3] + wFwd[b2 + k + 3];
+                if (f0 < wFwd[bt + k + 0]) AtomicMin(wFwd + bt + k + 0, f0);
+                if (f1 < wFwd[bt + k + 1]) AtomicMin(wFwd + bt + k + 1, f1);
+                if (f2 < wFwd[bt + k + 2]) AtomicMin(wFwd + bt + k + 2, f2);
+                if (f3 < wFwd[bt + k + 3]) AtomicMin(wFwd + bt + k + 3, f3);
+
+                float g0 = wBwd[b2 + k + 0] + wFwd[b1 + k + 0];
+                float g1 = wBwd[b2 + k + 1] + wFwd[b1 + k + 1];
+                float g2 = wBwd[b2 + k + 2] + wFwd[b1 + k + 2];
+                float g3 = wBwd[b2 + k + 3] + wFwd[b1 + k + 3];
+                if (g0 < wBwd[bt + k + 0]) AtomicMin(wBwd + bt + k + 0, g0);
+                if (g1 < wBwd[bt + k + 1]) AtomicMin(wBwd + bt + k + 1, g1);
+                if (g2 < wBwd[bt + k + 2]) AtomicMin(wBwd + bt + k + 2, g2);
+                if (g3 < wBwd[bt + k + 3]) AtomicMin(wBwd + bt + k + 3, g3);
+            }
+            for (; k < K; k++)
+            {
                 float f = wBwd[b1 + k] + wFwd[b2 + k];
                 if (f < wFwd[bt + k]) AtomicMin(wFwd + bt + k, f);
                 float b = wBwd[b2 + k] + wFwd[b1 + k];
