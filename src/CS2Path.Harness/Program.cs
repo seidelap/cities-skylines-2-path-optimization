@@ -279,6 +279,28 @@ namespace CS2Path.Harness
             // becomes one IJobParallelFor per level and additionally gets
             // Burst's vectorizer, so this ratio is a floor on the in-game win,
             // not an estimate of it.
+            // Split the two halves of "customization". ResetAll seeds every arc
+            // lane from its original edge weight; FullCustomize is the triangle
+            // sweep. They have completely different bottlenecks — seeding is
+            // scattered random access over edge attributes, the sweep is a
+            // streaming min-plus pass — so a single combined number hides which
+            // one any given change actually moved.
+            var resetMs = new List<double>();
+            var sweepMs = new List<double>();
+            for (int rep = 0; rep < 5; rep++)
+            {
+                sw.Restart();
+                eng.Metrics.ResetAll();
+                resetMs.Add(sw.Elapsed.TotalMilliseconds);
+                sw.Restart();
+                eng.Metrics.FullCustomize();
+                sweepMs.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            resetMs.Sort(); sweepMs.Sort();
+            double resetMed = resetMs[resetMs.Count / 2], sweepMed = sweepMs[sweepMs.Count / 2];
+            Console.WriteLine($"  split: ResetAll median {resetMed:N0} ms (spread {resetMs[0]:N0}-{resetMs[resetMs.Count - 1]:N0}) | " +
+                              $"sweep median {sweepMed:N0} ms (spread {sweepMs[0]:N0}-{sweepMs[sweepMs.Count - 1]:N0})");
+
             // Thread scaling, not just a single parallel number: if the sweep is
             // memory-bandwidth-bound rather than compute-bound, time flattens
             // early and no decomposition will fix it. That distinction decides
