@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace CS2Path.Core
 {
@@ -13,7 +14,7 @@ namespace CS2Path.Core
     /// triangles contain changed edges and propagates up the elimination tree
     /// only while a min actually changes.
     /// </summary>
-    public sealed class CchMetrics
+    public sealed unsafe class CchMetrics
     {
         public CchSkeleton C = null!;
         public AnchorGrid Anchors = null!;
@@ -97,62 +98,62 @@ namespace CS2Path.Core
         public void FullCustomize()
         {
             var c = C;
-            int n = c.NodeCount;
             ChangeEpoch++;
             Array.Fill(NodeArcChangeEpoch, ChangeEpoch); // everything (re)computed
-            for (int r = 0; r < n; r++)
-            {
-                int x = c.NodeAtRank[r];
-                int s = c.UpStart[x], e = c.UpStart[x + 1];
-                for (int i = s; i < e; i++)
-                {
-                    int a1 = i;                 // arc (x, A)
-                    int A = c.UpHead[i];
-                    // Merge-scan Up[x] and Up[A] by head id: common head B gives
-                    // triangle (x, A, B) with target arc t = (A, B) at its
-                    // position inside Up[A].
-                    int p = s, q = c.UpStart[A], qe = c.UpStart[A + 1];
-                    while (p < e && q < qe)
-                    {
-                        int hb = c.UpHead[p], hb2 = c.UpHead[q];
-                        if (hb < hb2) p++;
-                        else if (hb > hb2) q++;
-                        else
-                        {
-                            RelaxTriangle(a1, p, q); // a2 = (x,B) at p, t = (A,B) at q
-                            p++; q++;
-                        }
-                    }
-                }
-            }
+            fixed (float* wf = WFwd, wb = WBwd)
+            fixed (int* upStart = c.UpStart, upHead = c.UpHead, nodeAtRank = c.NodeAtRank)
+                BurstKernels.FullCustomizeRange(wf, wb, upStart, upHead, nodeAtRank, 0, c.NodeCount, K);
         }
 
-        /// <summary>fwd: A -> x -> B relaxes WFwd[t]; bwd: B -> x -> A relaxes WBwd[t].</summary>
-        private void RelaxTriangle(int a1, int a2, int t)
+        /// <summary>
+        /// Level-parallel full customization (plan §6: the sweep is
+        /// level-parallelizable). Nodes within one elimination-tree level have no
+        /// dependencies on each other, so each level is dispatched across threads
+        /// and levels are separated by a barrier.
+        ///
+        /// Bit-identical to <see cref="FullCustomize"/> — proven by
+        /// TestRunner.VerifyParallelCustomization, not merely asserted. Writes use
+        /// an atomic min, which is exact and order-independent, so no float
+        /// reassociation can occur.
+        ///
+        /// This is the exact shape the in-game Burst port takes: one
+        /// IJobParallelFor per level over the same kernel
+        /// (<see cref="BurstKernels.ContractLevelRange"/>), scheduled with a
+        /// dependency chain between levels.
+        /// </summary>
+        public void FullCustomizeParallel(int threads = 0)
         {
-            int b1 = a1 * K, b2 = a2 * K, bt = t * K;
-            int k = 0;
-            int vc = Vector<float>.Count;
-            if (Vector.IsHardwareAccelerated && K >= vc)
+            var c = C;
+            ChangeEpoch++;
+            Array.Fill(NodeArcChangeEpoch, ChangeEpoch);
+            if (threads <= 0) threads = Environment.ProcessorCount;
+            // Below this, thread dispatch costs more than the level saves.
+            const int MinNodesToSplit = 512;
+
+            fixed (float* wf = WFwd, wb = WBwd)
+            fixed (int* upStart = c.UpStart, upHead = c.UpHead, levelNodes = c.LevelNodes)
             {
-                for (; k <= K - vc; k += vc)
+                float* wfp = wf; float* wbp = wb;
+                int* usp = upStart; int* uhp = upHead; int* lnp = levelNodes;
+                for (int lvl = 0; lvl < c.LevelCount; lvl++)
                 {
-                    var w1b = new Vector<float>(WBwd, b1 + k);
-                    var w1f = new Vector<float>(WFwd, b1 + k);
-                    var w2b = new Vector<float>(WBwd, b2 + k);
-                    var w2f = new Vector<float>(WFwd, b2 + k);
-                    var tf = new Vector<float>(WFwd, bt + k);
-                    var tb = new Vector<float>(WBwd, bt + k);
-                    Vector.Min(tf, w1b + w2f).CopyTo(WFwd, bt + k);
-                    Vector.Min(tb, w2b + w1f).CopyTo(WBwd, bt + k);
+                    int from = c.LevelStart[lvl], to = c.LevelStart[lvl + 1];
+                    int count = to - from;
+                    if (count <= 0) continue;
+                    if (count < MinNodesToSplit || threads == 1)
+                    {
+                        BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, from, to, K);
+                        continue;
+                    }
+                    int chunk = (count + threads - 1) / threads;
+                    Parallel.For(0, threads, ti =>
+                    {
+                        int lo = from + ti * chunk;
+                        int hi = Math.Min(to, lo + chunk);
+                        if (lo < hi)
+                            BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, lo, hi, K);
+                    });
                 }
-            }
-            for (; k < K; k++)
-            {
-                float f = WBwd[b1 + k] + WFwd[b2 + k];
-                if (f < WFwd[bt + k]) WFwd[bt + k] = f;
-                float b = WBwd[b2 + k] + WFwd[b1 + k];
-                if (b < WBwd[bt + k]) WBwd[bt + k] = b;
             }
         }
 
@@ -217,33 +218,23 @@ namespace CS2Path.Core
             // Lower triangles: common down-neighbors x of v and w (merge by tail id).
             int p = c.DownStart[v], pe = c.DownStart[v + 1];
             int q = c.DownStart[w], qe = c.DownStart[w + 1];
-            while (p < pe && q < qe)
+            fixed (float* wf = WFwd, wb = WBwd, sf = _scratchF, sb = _scratchB)
             {
-                int tv = c.DownTail[p], tw = c.DownTail[q];
-                if (tv < tw) p++;
-                else if (tv > tw) q++;
-                else
+                while (p < pe && q < qe)
                 {
-                    int axv = c.DownArc[p], axw = c.DownArc[q]; // (x,v), (x,w)
-                    int bv = axv * K + kFrom, bw = axw * K + kFrom;
-                    for (int k = 0; k < kCount; k++)
+                    int tv = c.DownTail[p], tw = c.DownTail[q];
+                    if (tv < tw) p++;
+                    else if (tv > tw) q++;
+                    else
                     {
-                        float f = WBwd[bv + k] + WFwd[bw + k]; // v -> x -> w
-                        if (f < _scratchF[k]) _scratchF[k] = f;
-                        float b = WBwd[bw + k] + WFwd[bv + k]; // w -> x -> v
-                        if (b < _scratchB[k]) _scratchB[k] = b;
+                        int axv = c.DownArc[p], axw = c.DownArc[q]; // (x,v), (x,w)
+                        BurstKernels.FoldLowerTriangle(
+                            wf, wb, sf, sb, axv * K + kFrom, axw * K + kFrom, kCount);
+                        p++; q++;
                     }
-                    p++; q++;
                 }
+                return BurstKernels.CommitArc(wf, wb, sf, sb, a * K + kFrom, kCount) != 0;
             }
-            bool changed = false;
-            int ba = a * K + kFrom;
-            for (int k = 0; k < kCount; k++)
-            {
-                if (WFwd[ba + k] != _scratchF[k]) { WFwd[ba + k] = _scratchF[k]; changed = true; }
-                if (WBwd[ba + k] != _scratchB[k]) { WBwd[ba + k] = _scratchB[k]; changed = true; }
-            }
-            return changed;
         }
 
         /// <summary>Binary min-heap keyed by (rank(tail), rank(head)) — ascending

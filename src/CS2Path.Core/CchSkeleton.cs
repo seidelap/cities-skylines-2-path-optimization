@@ -47,6 +47,12 @@ namespace CS2Path.Core
         public int[] EtParent = null!;    // elimination tree parent (lowest-ranked up-neighbor), -1 at roots
         public int TreeHeight;
 
+        // Elimination-tree levels — the parallel schedule for customization.
+        // Nodes of level L are LevelNodes[LevelStart[L] .. LevelStart[L+1]).
+        public int LevelCount;
+        public int[] LevelStart = null!;
+        public int[] LevelNodes = null!;
+
         public static CchSkeleton Build(Graph g, int[] rank)
         {
             var c = new CchSkeleton { G = g, NodeCount = g.NodeCount, Rank = rank };
@@ -159,7 +165,54 @@ namespace CS2Path.Core
                 if (depth[v] > h2) h2 = depth[v];
             }
             c.TreeHeight = h2 + 1;
+            c.BuildLevels();
             return c;
+        }
+
+        /// <summary>
+        /// Group nodes into elimination-tree levels for parallel customization.
+        /// Level(v) = 1 + max(Level(children)); leaves are 0. Emitted CSR-style:
+        /// the nodes of level L are LevelNodes[LevelStart[L] .. LevelStart[L+1]).
+        ///
+        /// WHY THIS IS THE RIGHT PARALLEL DECOMPOSITION. Eliminating x relaxes
+        /// triangles (x, A, B), reading arcs (x,A)/(x,B) and writing arc (A,B).
+        /// Every contribution to (x,A) comes from a triangle (y, x, A) where y is
+        /// a DESCENDANT of x in the elimination tree — and descendants have
+        /// strictly lower level by construction. So once level L−1 is complete,
+        /// every input the level-L nodes read is final, and the nodes within a
+        /// level can run in any order or concurrently.
+        ///
+        /// Two same-level nodes CAN write the same target arc (A,B), so the write
+        /// must be an atomic min — but the result is still bit-identical to the
+        /// sequential sweep, because min is order-independent and exact.
+        /// </summary>
+        private void BuildLevels()
+        {
+            int n = NodeCount;
+            var level = new int[n];
+            int maxLevel = 0;
+            // Ascending rank guarantees children (lower rank) are done first.
+            for (int r = 0; r < n; r++)
+            {
+                int v = NodeAtRank[r];
+                int p = EtParent[v];
+                if (p >= 0 && level[v] + 1 > level[p]) level[p] = level[v] + 1;
+                if (level[v] > maxLevel) maxLevel = level[v];
+            }
+            LevelCount = maxLevel + 1;
+            LevelStart = new int[LevelCount + 1];
+            for (int v = 0; v < n; v++) LevelStart[level[v] + 1]++;
+            for (int l = 0; l < LevelCount; l++) LevelStart[l + 1] += LevelStart[l];
+            LevelNodes = new int[n];
+            var cursor = (int[])LevelStart.Clone();
+            // Fill in ascending rank so a level's node order is deterministic —
+            // parallel results must not depend on scheduling, and a stable order
+            // makes the sequential-vs-parallel equivalence test meaningful.
+            for (int r = 0; r < n; r++)
+            {
+                int v = NodeAtRank[r];
+                LevelNodes[cursor[level[v]]++] = v;
+            }
         }
 
         /// <summary>Arc id of upward arc (v,w) where rank[v] &lt; rank[w], or -1.

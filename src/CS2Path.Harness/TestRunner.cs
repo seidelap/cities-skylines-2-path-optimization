@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
 using CS2Path.Core;
 
@@ -55,6 +57,10 @@ namespace CS2Path.Harness
             VerifyEventDrivenBuckets(seed + 13);
             Console.WriteLine("verify: city-export round trip (format + corruption detection)...");
             VerifyCityExport(seed + 15);
+            Console.WriteLine("verify: parallel customization == sequential (bit-identical)...");
+            VerifyParallelCustomization(seed + 18);
+            Console.WriteLine("verify: Burst kernel portability (no managed constructs)...");
+            VerifyBurstKernelPortability();
             Console.WriteLine("verify: spatial nearest-node index vs brute force...");
             VerifySpatialIndex(seed + 16);
             Console.WriteLine("verify: A3 change-locality classifier (pocket vs scattered)...");
@@ -636,6 +642,148 @@ namespace CS2Path.Harness
             try { CityExport.Read(new System.IO.MemoryStream(ms.ToArray(), 0, (int)(ms.Length / 2))); }
             catch (Exception) { truncCaught = true; }
             Check(truncCaught, "truncated export was accepted instead of rejected");
+        }
+
+        private static void VerifyParallelCustomization(ulong seed)
+        {
+            // Bit-identical, not approximately-equal. The claim is that atomic-min
+            // level-parallel customization cannot reorder any float arithmetic:
+            // min is exact and order-independent, and every addend is read from an
+            // arc finalized at a strictly lower level. Exact equality is therefore
+            // the correct assertion, and a tolerance here would hide a real bug.
+            var city = SyntheticCity.Build(48, 48, 2500, 300, seed);
+            var anchors = city.BuildAnchors(8);
+            var eng = RoutingEngine.Build(city.G, anchors);
+            var m = eng.Metrics;
+
+            m.ResetAll();
+            m.FullCustomize();
+            var seqF = (float[])m.WFwd.Clone();
+            var seqB = (float[])m.WBwd.Clone();
+
+            // Several thread counts: a scheduling-order-dependent bug will not
+            // reproduce at every width.
+            foreach (int threads in new[] { 2, 3, 4, 8 })
+            {
+                m.ResetAll();
+                m.FullCustomizeParallel(threads);
+                int mismatches = 0;
+                for (int i = 0; i < seqF.Length; i++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m.WFwd[i]) != BitConverter.SingleToInt32Bits(seqF[i])) mismatches++;
+                    if (BitConverter.SingleToInt32Bits(m.WBwd[i]) != BitConverter.SingleToInt32Bits(seqB[i])) mismatches++;
+                }
+                Check(mismatches == 0, $"parallel customization diverged from sequential on {mismatches} lanes at {threads} threads");
+            }
+
+            // Levels must actually partition the nodes, or the sweep silently
+            // skips work and still "passes" the equality check above.
+            var c = eng.Skeleton;
+            Check(c.LevelCount > 1, $"degenerate level decomposition ({c.LevelCount} levels)");
+            Check(c.LevelStart[c.LevelCount] == c.NodeCount,
+                $"levels cover {c.LevelStart[c.LevelCount]}/{c.NodeCount} nodes");
+            var seen = new bool[c.NodeCount];
+            int dup = 0;
+            foreach (var v in c.LevelNodes) { if (seen[v]) dup++; seen[v] = true; }
+            Check(dup == 0, $"{dup} nodes appear in more than one level");
+
+            // The load-bearing invariant: a node's elimination-tree parent must
+            // sit at a strictly higher level, else a level could read an arc that
+            // is not yet final and the parallel sweep would be racy-by-design.
+            var lvlOf = new int[c.NodeCount];
+            for (int l = 0; l < c.LevelCount; l++)
+                for (int i = c.LevelStart[l]; i < c.LevelStart[l + 1]; i++) lvlOf[c.LevelNodes[i]] = l;
+            int inversions = 0;
+            for (int v = 0; v < c.NodeCount; v++)
+            {
+                int p = c.EtParent[v];
+                if (p >= 0 && lvlOf[p] <= lvlOf[v]) inversions++;
+            }
+            Check(inversions == 0, $"{inversions} elimination-tree edges do not increase level");
+        }
+
+        private static void VerifyBurstKernelPortability()
+        {
+            // Burst rejects every managed construct. Rather than discover that
+            // during an in-game build (where the toolchain is not available to us
+            // here), assert it against the kernel source directly, so the property
+            // is checked on every run of the suite.
+            string path = FindRepoFile("src/CS2Path.Core/BurstKernels.cs");
+            Check(path != null, "BurstKernels.cs not found for portability lint");
+            if (path == null) return;
+            var lines = File.ReadAllLines(path);
+
+            // Constructs Burst cannot compile. Deliberately matched on code only:
+            // comments explain WHY these are banned and must not trip the lint.
+            var banned = new (string pattern, string why)[]
+            {
+                ("System.Numerics", ".NET SIMD is invisible to Burst"),
+                ("List<", "managed collection"),
+                ("Dictionary<", "managed collection"),
+                ("string ", "managed type"),
+                ("new ", "allocation"),
+                ("throw ", "Burst has no managed exceptions"),
+                ("try", "no exception handling under Burst"),
+                ("foreach", "iterators allocate/box"),
+                ("class ", "reference type"),
+                ("delegate", "function pointers only"),
+                ("Console.", "no managed IO"),
+                ("Math.", "use branchless/intrinsic forms; Burst prefers its own math"),
+                ("[]", "managed array"),
+            };
+            // `static class` is REQUIRED, not forbidden: Burst compiles static
+            // methods, which must live in a static class or struct. Only a
+            // non-static (instantiable, reference-type) class is a violation.
+            bool BannedHere(string code, string pat)
+            {
+                if (pat != "class ") return code.Contains(pat);
+                int at = code.IndexOf("class ", StringComparison.Ordinal);
+                if (at < 0) return false;
+                return !code.Substring(0, at).Contains("static");
+            }
+            int violations = 0;
+            var detail = new List<string>();
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string raw = lines[i];
+                string code = raw;
+                int slash = code.IndexOf("//", StringComparison.Ordinal);
+                if (slash >= 0) code = code.Substring(0, slash);
+                string t = code.TrimStart();
+                if (t.StartsWith("*") || t.StartsWith("///")) continue; // doc comment body
+                foreach (var (pat, why) in banned)
+                {
+                    if (BannedHere(code, pat))
+                    {
+                        violations++;
+                        detail.Add($"L{i + 1}: '{pat}' ({why})");
+                    }
+                }
+            }
+            Check(violations == 0,
+                $"BurstKernels.cs contains {violations} Burst-hostile construct(s): {string.Join("; ", detail.Take(6))}");
+
+            // And it must genuinely be the code the engine runs, not a dead
+            // parallel copy that drifts out of sync.
+            string metrics = FindRepoFile("src/CS2Path.Core/CchMetrics.cs");
+            if (metrics != null)
+            {
+                string src = File.ReadAllText(metrics);
+                Check(src.Contains("BurstKernels.FullCustomizeRange"), "FullCustomize no longer routes through the kernel");
+                Check(src.Contains("BurstKernels.ContractLevelRange"), "parallel sweep no longer routes through the kernel");
+                Check(!src.Contains("System.Numerics"), "CchMetrics still imports .NET SIMD");
+            }
+        }
+
+        private static string? FindRepoFile(string rel)
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
+            {
+                string p = Path.Combine(dir.FullName, rel);
+                if (File.Exists(p)) return p;
+            }
+            return null;
         }
 
         private static void VerifySpatialIndex(ulong seed)

@@ -273,6 +273,30 @@ namespace CS2Path.Harness
             eng.Metrics.FullCustomize();
             double fullMs = sw.Elapsed.TotalMilliseconds;
 
+            // Level-parallel A/B. Out of game this measures the SCHEDULE, not
+            // Burst codegen: same kernel, same arithmetic, dispatched across
+            // elimination-tree levels. In-game the identical decomposition
+            // becomes one IJobParallelFor per level and additionally gets
+            // Burst's vectorizer, so this ratio is a floor on the in-game win,
+            // not an estimate of it.
+            var parMs = new List<double>();
+            for (int rep = 0; rep < 3; rep++)
+            {
+                eng.Metrics.ResetAll();
+                sw.Restart();
+                eng.Metrics.FullCustomizeParallel();
+                parMs.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            parMs.Sort();
+            double fullParMs = parMs[parMs.Count / 2];
+            Console.WriteLine($"  full customize: sequential {fullMs:N0} ms -> level-parallel {fullParMs:N0} ms " +
+                              $"({fullMs / Math.Max(0.001, fullParMs):0.0}x on {Environment.ProcessorCount} cores, " +
+                              $"{eng.Skeleton.LevelCount} levels)");
+            // Leave the engine in the canonical sequential state for everything
+            // that follows, so no later measurement inherits the parallel run.
+            eng.Metrics.ResetAll();
+            eng.Metrics.FullCustomize();
+
             // Typical congestion deltas: ±10% multiplicative drift on the live
             // time of spatially random edges — what a 3%-threshold EMA feed
             // produces each refresh. One large-shock round is reported
@@ -344,7 +368,8 @@ namespace CS2Path.Harness
             sb.AppendLine();
             sb.AppendLine("| operation | time | §6 target |");
             sb.AppendLine("|---|---|---|");
-            sb.AppendLine($"| full customization, all {K} metrics | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
+            sb.AppendLine($"| full customization, all {K} metrics (sequential) | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
+            sb.AppendLine($"| full customization, level-parallel ({Environment.ProcessorCount} cores, {eng.Skeleton.LevelCount} levels) | **{fullParMs:N0} ms** ({fullMs / Math.Max(0.001, fullParMs):0.0}× ) | same kernel; in-game adds Burst codegen on top |");
             sb.AppendLine($"| partial, 100 edges ±10% drift, scattered (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / Rounds:N0} arcs) | < 1 ms |");
             sb.AppendLine($"| partial, 150 edges ±10% drift, clustered (one congestion pocket) | median {Pct(partialClustered, 0.5):0.00} ms, p99 {Pct(partialClustered, 0.99):0.00} ms ({arcsClustered / Rounds:N0} arcs) | < 1 ms |");
             sb.AppendLine($"| partial, 1000 edges ±10% drift, scattered (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / Rounds:N0} arcs) | — |");
