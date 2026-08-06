@@ -59,7 +59,7 @@ Graph: **131,039 nodes / 482,554 directed lane-edges** (three road tiers, holes)
 |---|---|---|
 | full customization, all 16 metrics | 531 ms | < 10 ms (Burst/SIMD budget) |
 | full customization split: seeding vs sweep | ResetAll 190 ms (21%) + triangle sweep 717 ms (79%), sweep stable to ±0.7% | the ported half is the dominant half |
-| full customization, level-parallel thread scaling (331 levels, 4-core container) | 1t=940 ms (0.98×), 2t=1,024 ms (0.90×), **4t=737 ms (1.26×)** | see "Burst port" below — this decomposition does **not** scale here |
+| full customization, level-parallel (331 levels, 4-core container) | vs the 722 ms rank-order sweep: 1t=998 ms (0.72×), 2t=950 ms (0.76×), **4t=667 ms (1.08×)** | **no speedup**; level ordering costs 38% before threads help — see "Burst port" |
 | partial, 100 edges ±10% drift, scattered (live lanes) | median 92.38 ms, p99 218.56 ms (43,016 arcs) | < 1 ms |
 | partial, 150 edges ±10% drift, clustered (one congestion pocket) | median 6.92 ms, p99 15.24 ms (3,362 arcs) | < 1 ms |
 | partial, 1000 edges ±10% drift, scattered (live lanes) | median 500.60 ms, p99 533.74 ms (282,503 arcs) | — |
@@ -302,58 +302,74 @@ it waits on. That change was kept for a different and real reason: the
 descriptor table is blittable, which is what makes the seeding pass portable to
 Burst at all.
 
-### What did NOT work, and why
+### What did NOT work, and why — corrected by adversarial review
 
-Level-parallel customization was supposed to be the payoff. Measured on the
-4-core container, against 871 ms sequential:
+Level-parallel customization was meant to be the payoff. It is not, and the
+first three attempts to explain why were all wrong. A 27-agent adversarial
+review (22 findings raised, 11 confirmed) invalidated the measurements
+themselves; what follows is the corrected picture.
 
-| threads | time | vs sequential |
+Baseline is the **triangle sweep only, rank order, non-atomic** — 722 ms:
+
+| configuration | time | vs baseline |
 |---|---|---|
-| 1 | 929 ms | 0.94× |
-| 2 | 1,004 ms | **0.87×** |
-| 4 | 748 ms | 1.16× |
+| sequential, rank order | 722 ms | 1.00× |
+| level order, 1 thread | 998 ms | **0.72×** |
+| level order, 2 threads | 950 ms | 0.76× |
+| level order, 4 threads | 667 ms | **1.08×** |
 
-**The curve is non-monotonic**, which rules out a clean bandwidth ceiling and
-points at contention. Three contributing causes, in order of confidence:
+**Net result at 4 cores: 1.08×, i.e. essentially nothing.** But the shape is
+informative: measured against *its own* single-thread baseline the parallelism
+delivers 998/667 = **1.50× on 4 cores**. It works — it just starts from a 38%
+hole, because visiting nodes in level order instead of rank order costs that
+much in locality before a single thread is added.
 
-1. **False sharing, structurally.** The layout is arc-major with K=16 lanes, so
-   one arc's weights are `16 × 4 B = exactly one 64-byte cache line`. Two
-   threads working adjacent arcs contend on the same line even when they touch
-   no common data. That 2-thread regression is the signature.
-2. **Level ordering costs locality.** Even at 1 thread the parallel path is 6%
-   slower than the sequential sweep, because it visits nodes in level order
-   while the sequential sweep visits in rank order, which matches the arc
-   layout.
-3. **Wrong axis for where the work is.** Road-network elimination trees are wide
-   and cheap at the leaves but narrow and expensive at the top separators — 331
-   levels averaging ~396 nodes. Node-parallelism is weakest exactly where the
-   cost concentrates.
+### Three wrong explanations, and what actually corrected them
 
-Two earlier defects were found and fixed along the way (a first cut ran at
-0.8×): `ContractLevelRange` forced the atomic path even on levels executed
-serially, and the atomic relax CAS'd unconditionally instead of testing for an
-improvement first.
+Recording these because the errors are more instructive than the result, and
+because each survived my own review and was caught only by adversarial
+measurement.
 
-### Honest status
+1. **"Speedup is 1.26× at 4 cores."** Wrong: the numerator included `ResetAll`
+   (~190 ms) while the parallel timings excluded it. Comparing like with like,
+   that figure was 0.99×. Every ratio previously published in this section was
+   inflated by the seeding cost.
+2. **"The 2-thread regression is the signature of false sharing."** Wrong, and
+   disproved by experiment rather than argument: a verifier re-ran the identical
+   schedule on 64-byte-aligned unmanaged buffers against a 24-byte-offset
+   control and measured 61.2 vs 60.9 ms at two threads. Alignment moves ~0%;
+   cross-chunk cache-line sharing is 0.05–0.14%. The "alignment is the next
+   lever" roadmap item this document previously carried would have been wasted
+   work.
+3. **"1t → 2t is a thread-scaling regression."** Wrong: they are not the same
+   computation. `threads==1` routes 100% of work through the fast non-atomic
+   kernel, `threads>=2` sends ~95% through the ~2× slower atomic one. The
+   regression is arithmetic, not architectural.
 
-**Burst compatibility: delivered and enforced.** **Parallel speedup: not
-demonstrated on this hardware** — 1.16× at 4 cores, non-monotonic, and the
-sequential path remains the default (`FullCustomizeParallel` is opt-in).
+**What the wall actually is.** The same schedule with the atomic removed scales
+1.98× at two threads, so the atomic kernel — not memory layout — is the
+constraint, alongside the 38% level-ordering tax. `RelaxTriangleAtomic` has
+since been given the same 4-wide test-then-CAS shape as its non-atomic twin,
+which is what moved 4 threads from 737 ms to 667 ms.
 
-This does not transfer as a negative result to the game: CS2 machines have
-8–16 cores, and Unity's job system schedules far more cheaply than
-`Parallel.For` per level. But that is a hypothesis, and it is not evidence.
+**Honest status: Burst compatibility delivered and enforced; parallel speedup
+not.** Sequential remains the default (`FullCustomizeParallel` is opt-in). The
+two levers that follow from the corrected diagnosis are (a) eliminating the
+atomic entirely — the review found only 6–118 arcs are genuinely cross-chunk,
+so a conflict-free partition looks reachable — and (b) removing the ordering
+tax by processing levels in rank order within each level. Neither is
+speculative now; both attack measured causes.
 
-**The next lever, now testable.** With the sweep resolving to ±0.7%, the
-false-sharing hypothesis is finally falsifiable. The fix is alignment, not
-padding: managed arrays are 8-byte aligned, so an arc's 16 lanes (64 B)
-generally *straddle two* cache lines rather than occupying one. Moving `WFwd`/
-`WBwd` to 64-byte-aligned unmanaged allocations would put each arc's block on
-exactly one line — and would move the buffers closer to `NativeArray`
-semantics, which the in-game path wants anyway. If that does not restore
-scaling, node-level parallelism is the wrong axis here and the honest
-conclusion is that customization throughput must come from Burst codegen
-rather than from threads.
+### A note on the tests
+
+The bit-identity check that gave me confidence in the parallel path was itself
+too weak, and the review proved it: a build with the atomic min **deleted**
+still passes ~199 runs in 200, because only ~6% of triangles land in splittable
+levels and just 6–118 arcs are ever written from two chunks. Racing for a race
+is not a test. It is replaced by deterministic counting of the two invariants
+the schedule actually depends on — zero arcs read-and-written within one level,
+and non-zero arcs written by two nodes of one level — both asserted on every
+run.
 
 ## A1 answered on REAL road networks (not the synthetic city)
 
@@ -433,7 +449,7 @@ game. `harness import` already reports it whenever a demand trace is present
 |---|---|---|
 | point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **169–360 µs p99, 112–203× vs Dijkstra** across the real-morphology sweep (Ruhr 134k: 87 µs median / 169 µs p99; greater Paris 202k: 216/360 µs; NY 264k: 132/273 µs) with Inertial Flow separators | architectural claim now holds on real maps at synthetic-benchmark levels; the absolute 20 µs still needs Burst-class constant factors |
 | point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 174 µs p99 (94.5 µs median), 122× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; remaining gap to the absolute target is Burst-class constant factors |
-| full customization < 10 ms | 531 ms (16 metrics, single-thread C#; halved by the smaller flow-cut cliques). Split: seeding 190 ms (21%) + triangle sweep 717 ms (79%). Level-parallel gives only **1.26× at 4 cores and is non-monotonic** (see the Burst-port section) | **miss, and the headroom claim is weaker than previously stated**: the sweep is Burst-legal and bit-identical under parallelism, but thread-parallelism did not deliver here. Leading suspect is 8-byte-aligned managed arrays making each arc's 64-byte lane block straddle two cache lines. Alignment work, not more threads, is the next lever — and the sweep now measures to ±0.7%, so it is finally falsifiable |
+| full customization < 10 ms | 531 ms (16 metrics, single-thread C#). Split: seeding 190 ms (21%) + sweep 722 ms (79%). Level-parallel nets **1.08× at 4 cores** — no real gain | **miss.** The sweep is Burst-legal and bit-identical under parallelism, but thread-parallelism does not pay here: level ordering costs 38% up front and the atomic kernel is ~2× the non-atomic one. An earlier false-sharing diagnosis was disproved by direct measurement (64-byte alignment moves ~0%). Next levers, both measured rather than guessed: a conflict-free partition that removes the atomic, and rank-ordered traversal within levels |
 | typical partial customization < 1 ms | 6.9 ms median for a clustered congestion pocket (3,362 of 1.7M arcs — 0.2%); scattered random edges 92 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 6.5× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
 | oscillation amplitude reduced ≥ 5× | **5.9×** vs the oscillating vanilla regime (fast signal, re-measured under the flow partitioner); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |

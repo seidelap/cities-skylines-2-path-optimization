@@ -160,10 +160,19 @@ an assertion that the concurrent path actually engaged, so the test cannot pass
 vacuously), and a linter in the verify suite rejects managed constructs in the
 kernel file and confirms `CchMetrics` really routes through it.
 
-**Not done.** Level-parallel customization reaches only **1.26× on 4 cores**
-and the curve is non-monotonic (1t 0.98×, 2t 0.90×, 4t 1.26×). Leading suspect
-is false sharing: managed arrays are 8-byte aligned, so an arc's 16 lanes
-(64 B) straddle two cache lines. Sequential remains the default path.
+**Not done.** Level-parallel customization nets **1.08× on 4 cores** — no real
+gain. Measured against the 722 ms rank-order sweep: 1t=998 ms, 2t=950 ms,
+4t=667 ms. The parallelism itself works (1.50× against its own 1-thread
+baseline) but starts from a 38% hole, because level-order traversal costs that
+much in locality. Sequential remains the default.
+
+An adversarial review corrected three wrong explanations I had published here:
+the speedup ratios divided a numerator containing `ResetAll` by timings that
+excluded it; 1-thread and 2-thread runs were not the same computation (100%
+non-atomic vs ~95% atomic kernel); and false sharing was disproved outright —
+re-running the identical schedule on 64-byte-aligned buffers moved it ~0%. The
+real constraint is the atomic kernel (~2× the non-atomic one) plus the ordering
+tax. Details and the corrected table are in [`RESULTS.md`](RESULTS.md).
 
 **One in-game detail that must not be "optimized" later:** the job wrappers pin
 `FloatMode.Strict`. Burst's default fast-math permits reassociation and FMA
