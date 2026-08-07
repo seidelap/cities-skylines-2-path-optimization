@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace CS2Path.Core
 {
@@ -13,7 +14,7 @@ namespace CS2Path.Core
     /// triangles contain changed edges and propagates up the elimination tree
     /// only while a min actually changes.
     /// </summary>
-    public sealed class CchMetrics
+    public sealed unsafe class CchMetrics
     {
         public CchSkeleton C = null!;
         public AnchorGrid Anchors = null!;
@@ -24,6 +25,20 @@ namespace CS2Path.Core
         public float[] WBwd = null!;        // head -> tail
 
         public long LastPartialArcsRecomputed; // telemetry
+
+        /// <summary>Levels narrower than this run serially (dispatch would cost
+        /// more than the split saves). Public so the bit-identity test can assert
+        /// the parallel path was actually EXERCISED — if every level of the test
+        /// graph fell below this, the test would be silently vacuous.</summary>
+        public const int MinLevelNodesToSplit = 96;
+
+        /// <summary>Levels that actually ran multi-threaded in the last
+        /// FullCustomizeParallel call. Zero means the run was serial throughout.</summary>
+        public int LastParallelLevelsSplit;
+
+        /// <summary>Tasks executed by the last FullCustomizeParallelTasks call
+        /// (0 = fell back to sequential because no frontier was built).</summary>
+        public int LastTasksRun;
 
         /// <summary>Monotonic epoch, bumped per (partial) customization. Together
         /// with NodeArcChangeEpoch this is the "dirty flag" consumers use to
@@ -37,6 +52,22 @@ namespace CS2Path.Core
         private bool[] _inQueue = null!;
         private LongHeap _heap;
         private float[] _scratchF = null!, _scratchB = null!;
+
+        // Parallel-edge overflow flattened to CSR for the seeding kernel (the
+        // skeleton's Dictionary form stays authoritative for managed callers).
+        private int[] _extraFwdStart = null!, _extraFwdEdge = null!;
+        private int[] _extraBwdStart = null!, _extraBwdEdge = null!;
+
+        private static (int[] start, int[] edges) FlattenExtras(Dictionary<int, int[]> map, int arcCount)
+        {
+            var start = new int[arcCount + 1];
+            foreach (var kv in map) start[kv.Key + 1] = kv.Value.Length;
+            for (int a = 0; a < arcCount; a++) start[a + 1] += start[a];
+            var edges = new int[start[arcCount]];
+            foreach (var kv in map)
+                Array.Copy(kv.Value, 0, edges, start[kv.Key], kv.Value.Length);
+            return (start, edges);
+        }
 
         public static CchMetrics Create(CchSkeleton c, AnchorGrid anchors)
         {
@@ -53,6 +84,8 @@ namespace CS2Path.Core
             m._scratchF = new float[m.K];
             m._scratchB = new float[m.K];
             m.NodeArcChangeEpoch = new int[c.NodeCount];
+            (m._extraFwdStart, m._extraFwdEdge) = FlattenExtras(c.ExtraFwd, c.ArcCount);
+            (m._extraBwdStart, m._extraBwdEdge) = FlattenExtras(c.ExtraBwd, c.ArcCount);
             return m;
         }
 
@@ -74,17 +107,49 @@ namespace CS2Path.Core
         }
 
         /// <summary>Load original-edge weights (or +inf for pure shortcuts) for
-        /// lanes [kFrom, kFrom+kCount).</summary>
+        /// lanes [kFrom, kFrom+kCount). Embarrassingly parallel — every arc's
+        /// lanes depend only on that arc's own edges — so the arc range is
+        /// split across threads with no synchronization. The kernel replicates
+        /// AnchorGrid.EdgeWeight expression-for-expression, and the verify
+        /// suite pins the two implementations bit-identical.</summary>
         public void Reset(int kFrom, int kCount)
         {
             var c = C;
-            for (int a = 0; a < c.ArcCount; a++)
+            var g = c.G;
+            var descs = Anchors.Descriptors;
+            fixed (float* wf = WFwd, wb = WBwd,
+                   tf = g.TimeFree, tt = g.TimeTypical, tl = g.TimeLive,
+                   mo = g.Money, co = g.Comfort, cm = g.ClosureMult)
+            fixed (AnchorGrid.MetricDesc* dp = descs)
+            fixed (int* of = c.OrigFwd, ob = c.OrigBwd,
+                   efs = _extraFwdStart, efe = _extraFwdEdge,
+                   ebs = _extraBwdStart, ebe = _extraBwdEdge)
             {
-                int baseA = a * K;
-                for (int k = kFrom; k < kFrom + kCount; k++)
+                var ctx = new BurstKernels.SeedContext
                 {
-                    WFwd[baseA + k] = OriginalArcWeight(a, k, true);
-                    WBwd[baseA + k] = OriginalArcWeight(a, k, false);
+                    WFwd = wf, WBwd = wb,
+                    TimeFree = tf, TimeTypical = tt, TimeLive = tl,
+                    Money = mo, Comfort = co, ClosureMult = cm,
+                    Desc = dp, OrigFwd = of, OrigBwd = ob,
+                    ExtraFwdStart = efs, ExtraFwdEdge = efe,
+                    ExtraBwdStart = ebs, ExtraBwdEdge = ebe,
+                    K = K,
+                };
+                int threads = Environment.ProcessorCount;
+                if (c.ArcCount < 32_768 || threads == 1)
+                {
+                    BurstKernels.SeedArcs(in ctx, 0, c.ArcCount, kFrom, kCount);
+                }
+                else
+                {
+                    int chunk = (c.ArcCount + threads - 1) / threads;
+                    var ctxLocal = ctx;
+                    Parallel.For(0, threads, ti =>
+                    {
+                        int lo = ti * chunk;
+                        int hiA = Math.Min(c.ArcCount, lo + chunk);
+                        if (lo < hiA) BurstKernels.SeedArcs(in ctxLocal, lo, hiA, kFrom, kCount);
+                    });
                 }
             }
         }
@@ -97,62 +162,146 @@ namespace CS2Path.Core
         public void FullCustomize()
         {
             var c = C;
-            int n = c.NodeCount;
             ChangeEpoch++;
             Array.Fill(NodeArcChangeEpoch, ChangeEpoch); // everything (re)computed
-            for (int r = 0; r < n; r++)
+            fixed (float* wf = WFwd, wb = WBwd)
+            fixed (int* upStart = c.UpStart, upHead = c.UpHead, nodeAtRank = c.NodeAtRank)
+                BurstKernels.FullCustomizeRange(wf, wb, upStart, upHead, nodeAtRank, 0, c.NodeCount, K);
+        }
+
+        /// <summary>
+        /// Level-parallel full customization (plan §6: the sweep is
+        /// level-parallelizable). Nodes within one elimination-tree level have no
+        /// dependencies on each other, so each level is dispatched across threads
+        /// and levels are separated by a barrier.
+        ///
+        /// Bit-identical to <see cref="FullCustomize"/> — proven by
+        /// TestRunner.VerifyParallelCustomization, not merely asserted. Writes use
+        /// an atomic min, which is exact and order-independent, so no float
+        /// reassociation can occur.
+        ///
+        /// This is the exact shape the in-game Burst port takes: one
+        /// IJobParallelFor per level over the same kernel
+        /// (<see cref="BurstKernels.ContractLevelRange"/>), scheduled with a
+        /// dependency chain between levels.
+        /// </summary>
+        public void FullCustomizeParallel(int threads = 0)
+        {
+            var c = C;
+            ChangeEpoch++;
+            Array.Fill(NodeArcChangeEpoch, ChangeEpoch);
+            if (threads <= 0) threads = Environment.ProcessorCount;
+            LastParallelLevelsSplit = 0;
+            // Below this, thread dispatch costs more than splitting the level
+            // saves. Measured: at 131k nodes the tree has 331 levels averaging
+            // ~400 nodes, so a threshold of 512 sent nearly every level down the
+            // serial path — and the serial path was still paying atomic-CAS cost,
+            // which is why the first cut of this ran at 0.8x sequential. Levels
+            // below the threshold now run the plain non-atomic kernel.
+            const int MinNodesToSplit = MinLevelNodesToSplit;
+
+            fixed (float* wf = WFwd, wb = WBwd)
+            fixed (int* upStart = c.UpStart, upHead = c.UpHead, levelNodes = c.LevelNodes)
             {
-                int x = c.NodeAtRank[r];
-                int s = c.UpStart[x], e = c.UpStart[x + 1];
-                for (int i = s; i < e; i++)
+                float* wfp = wf; float* wbp = wb;
+                int* usp = upStart; int* uhp = upHead; int* lnp = levelNodes;
+                for (int lvl = 0; lvl < c.LevelCount; lvl++)
                 {
-                    int a1 = i;                 // arc (x, A)
-                    int A = c.UpHead[i];
-                    // Merge-scan Up[x] and Up[A] by head id: common head B gives
-                    // triangle (x, A, B) with target arc t = (A, B) at its
-                    // position inside Up[A].
-                    int p = s, q = c.UpStart[A], qe = c.UpStart[A + 1];
-                    while (p < e && q < qe)
+                    int from = c.LevelStart[lvl], to = c.LevelStart[lvl + 1];
+                    int count = to - from;
+                    if (count <= 0) continue;
+                    if (count < MinNodesToSplit || threads == 1)
                     {
-                        int hb = c.UpHead[p], hb2 = c.UpHead[q];
-                        if (hb < hb2) p++;
-                        else if (hb > hb2) q++;
-                        else
-                        {
-                            RelaxTriangle(a1, p, q); // a2 = (x,B) at p, t = (A,B) at q
-                            p++; q++;
-                        }
+                        // Single-threaded over the whole level => no concurrent
+                        // writer => the fast non-atomic, vectorizable kernel.
+                        BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, from, to, K, 0);
+                        continue;
                     }
+                    // Contiguous chunks, NOT round-robin. Nodes within a level are
+                    // stored in ascending rank, and rank order correlates with
+                    // arc-block order, so contiguous chunks keep each thread on
+                    // its own stretch of the weight arrays. With K=16 an arc's
+                    // lanes are exactly one 64-byte cache line, so interleaving
+                    // threads across neighbouring arcs would make every write a
+                    // false-sharing event — the suspected cause of the 2-thread
+                    // regression measured before this was tuned.
+                    LastParallelLevelsSplit++;
+                    int chunk = (count + threads - 1) / threads;
+                    Parallel.For(0, threads, ti =>
+                    {
+                        int lo = from + ti * chunk;
+                        int hi = Math.Min(to, lo + chunk);
+                        if (lo < hi)
+                            BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, lo, hi, K, 1);
+                    });
                 }
             }
         }
 
-        /// <summary>fwd: A -> x -> B relaxes WFwd[t]; bwd: B -> x -> A relaxes WBwd[t].</summary>
-        private void RelaxTriangle(int a1, int a2, int t)
+        /// <summary>
+        /// Task-parallel full customization over dissection-cell subtrees — the
+        /// replacement for the level scheme after measurement showed the level
+        /// approach nets ~1.08× (a 38% level-order locality tax plus a ~2×
+        /// atomic kernel on ~95% of triangles).
+        ///
+        /// Each task is a contiguous, downward-closed rank range, contracted in
+        /// RANK ORDER with the plain vectorizable kernel; only writes into
+        /// enclosing separators (target tail outside the task) pay an atomic
+        /// min. Phase 2 contracts the remaining separator ranks sequentially,
+        /// ascending — by then every task input below them is final.
+        ///
+        /// Bit-identical to <see cref="FullCustomize"/>: the candidate multiset
+        /// per arc is unchanged, min is exact and order-independent, and the
+        /// verify suite asserts identity plus the structural invariants
+        /// (partition, downward closure, cross-task contention counted
+        /// deterministically).
+        /// </summary>
+        public void FullCustomizeParallelTasks(int threads = 0)
         {
-            int b1 = a1 * K, b2 = a2 * K, bt = t * K;
-            int k = 0;
-            int vc = Vector<float>.Count;
-            if (Vector.IsHardwareAccelerated && K >= vc)
+            var c = C;
+            if (c.TaskLo == null || c.TaskHi == null || c.Phase2Ranks == null || c.TaskLo.Length < 2)
             {
-                for (; k <= K - vc; k += vc)
-                {
-                    var w1b = new Vector<float>(WBwd, b1 + k);
-                    var w1f = new Vector<float>(WFwd, b1 + k);
-                    var w2b = new Vector<float>(WBwd, b2 + k);
-                    var w2f = new Vector<float>(WFwd, b2 + k);
-                    var tf = new Vector<float>(WFwd, bt + k);
-                    var tb = new Vector<float>(WBwd, bt + k);
-                    Vector.Min(tf, w1b + w2f).CopyTo(WFwd, bt + k);
-                    Vector.Min(tb, w2b + w1f).CopyTo(WBwd, bt + k);
-                }
+                LastTasksRun = 0;
+                FullCustomize();
+                return;
             }
-            for (; k < K; k++)
+            ChangeEpoch++;
+            Array.Fill(NodeArcChangeEpoch, ChangeEpoch);
+            if (threads <= 0) threads = Environment.ProcessorCount;
+            int nTasks = c.TaskLo.Length;
+            LastTasksRun = nTasks;
+
+            // Largest tasks first: with ~4 tasks per core, finishing a monster
+            // last is the main load-imbalance risk.
+            var order = new int[nTasks];
+            for (int i = 0; i < nTasks; i++) order[i] = i;
+            var sizes = new int[nTasks];
+            for (int i = 0; i < nTasks; i++) sizes[i] = c.TaskHi[i] - c.TaskLo[i];
+            Array.Sort(sizes, order);
+            Array.Reverse(order);
+
+            fixed (float* wf = WFwd, wb = WBwd)
+            fixed (int* upStart = c.UpStart, upHead = c.UpHead, nodeAtRank = c.NodeAtRank, rank = c.Rank)
             {
-                float f = WBwd[b1 + k] + WFwd[b2 + k];
-                if (f < WFwd[bt + k]) WFwd[bt + k] = f;
-                float b = WBwd[b2 + k] + WFwd[b1 + k];
-                if (b < WBwd[bt + k]) WBwd[bt + k] = b;
+                float* wfp = wf; float* wbp = wb;
+                int* usp = upStart; int* uhp = upHead; int* nrp = nodeAtRank; int* rkp = rank;
+                int next = -1;
+                var lo = c.TaskLo; var hi = c.TaskHi;
+                var ordLocal = order;
+                Parallel.For(0, Math.Min(threads, nTasks), _ =>
+                {
+                    while (true)
+                    {
+                        int slot = Interlocked.Increment(ref next);
+                        if (slot >= nTasks) return;
+                        int t = ordLocal[slot];
+                        BurstKernels.CustomizeTaskRange(wfp, wbp, usp, uhp, nrp, rkp, lo[t], hi[t], K);
+                    }
+                });
+                // Phase 2: enclosing separators, ascending rank, single thread.
+                var p2 = c.Phase2Ranks;
+                for (int i = 0; i < p2.Length; i++)
+                    BurstKernels.ContractNode(wfp, wbp, usp, uhp, nrp[p2[i]], K, 0);
             }
         }
 
@@ -217,33 +366,23 @@ namespace CS2Path.Core
             // Lower triangles: common down-neighbors x of v and w (merge by tail id).
             int p = c.DownStart[v], pe = c.DownStart[v + 1];
             int q = c.DownStart[w], qe = c.DownStart[w + 1];
-            while (p < pe && q < qe)
+            fixed (float* wf = WFwd, wb = WBwd, sf = _scratchF, sb = _scratchB)
             {
-                int tv = c.DownTail[p], tw = c.DownTail[q];
-                if (tv < tw) p++;
-                else if (tv > tw) q++;
-                else
+                while (p < pe && q < qe)
                 {
-                    int axv = c.DownArc[p], axw = c.DownArc[q]; // (x,v), (x,w)
-                    int bv = axv * K + kFrom, bw = axw * K + kFrom;
-                    for (int k = 0; k < kCount; k++)
+                    int tv = c.DownTail[p], tw = c.DownTail[q];
+                    if (tv < tw) p++;
+                    else if (tv > tw) q++;
+                    else
                     {
-                        float f = WBwd[bv + k] + WFwd[bw + k]; // v -> x -> w
-                        if (f < _scratchF[k]) _scratchF[k] = f;
-                        float b = WBwd[bw + k] + WFwd[bv + k]; // w -> x -> v
-                        if (b < _scratchB[k]) _scratchB[k] = b;
+                        int axv = c.DownArc[p], axw = c.DownArc[q]; // (x,v), (x,w)
+                        BurstKernels.FoldLowerTriangle(
+                            wf, wb, sf, sb, axv * K + kFrom, axw * K + kFrom, kCount);
+                        p++; q++;
                     }
-                    p++; q++;
                 }
+                return BurstKernels.CommitArc(wf, wb, sf, sb, a * K + kFrom, kCount) != 0;
             }
-            bool changed = false;
-            int ba = a * K + kFrom;
-            for (int k = 0; k < kCount; k++)
-            {
-                if (WFwd[ba + k] != _scratchF[k]) { WFwd[ba + k] = _scratchF[k]; changed = true; }
-                if (WBwd[ba + k] != _scratchB[k]) { WBwd[ba + k] = _scratchB[k]; changed = true; }
-            }
-            return changed;
         }
 
         /// <summary>Binary min-heap keyed by (rank(tail), rank(head)) — ascending

@@ -23,6 +23,53 @@ namespace CS2Path.Core
 
         public Preference PrefOf(int metric) => Profiles[metric % Profiles.Length];
         public Scenario ScenarioOf(int metric) => Scenarios[metric / Profiles.Length];
+
+        /// <summary>
+        /// Flattened per-lane descriptor: the preference vector and scenario for
+        /// metric m, precomputed once.
+        ///
+        /// WHY THIS EXISTS. <see cref="EdgeWeight"/> is the innermost call of
+        /// customization — it runs once per lane per direction per arc, roughly
+        /// 54 million times per full customization at 131k nodes. Resolving the
+        /// lane through PrefOf/ScenarioOf costs an integer MODULO plus an integer
+        /// DIVIDE every single time, and integer division is one of the most
+        /// expensive scalar ops on the machine. None of it varies with the edge,
+        /// so all of it is hoistable to a table built once.
+        ///
+        /// Blittable on purpose: this is exactly the shape a Burst kernel can
+        /// take as a pointer, which is what lets the seeding pass be ported
+        /// alongside the triangle sweep.
+        /// </summary>
+        public struct MetricDesc
+        {
+            public float PrefT, PrefM, PrefC;
+            public int Scen;                 // (int)Scenario
+        }
+
+        private MetricDesc[]? _desc;
+
+        /// <summary>Per-lane descriptors, built on first use and after any change
+        /// to Profiles/Scenarios.</summary>
+        public MetricDesc[] Descriptors
+        {
+            get
+            {
+                var d = _desc;
+                if (d != null && d.Length == MetricCount) return d;
+                d = new MetricDesc[MetricCount];
+                for (int m = 0; m < d.Length; m++)
+                {
+                    var p = Profiles[m % Profiles.Length];
+                    d[m] = new MetricDesc
+                    {
+                        PrefT = p.Time, PrefM = p.Money, PrefC = p.Comfort,
+                        Scen = (int)Scenarios[m / Profiles.Length],
+                    };
+                }
+                _desc = d;
+                return d;
+            }
+        }
         public bool HasScenario(Scenario s) => Array.IndexOf(Scenarios, s) >= 0;
         public int MetricIndex(int profileIdx, Scenario s)
         {
@@ -105,18 +152,23 @@ namespace CS2Path.Core
         {
             float mult = g.ClosureMult[edge];
             if (float.IsPositiveInfinity(mult)) return float.PositiveInfinity;
-            var pref = PrefOf(metric);
-            var scen = ScenarioOf(metric);
-            switch (scen)
+            // Table lookup instead of a modulo + divide per call. The arithmetic
+            // below is byte-for-byte the previous expression in the previous
+            // order, so results stay bit-identical — verified by the whole suite
+            // continuing to match reference Dijkstra exactly.
+            ref readonly var d = ref Descriptors[metric];
+            switch ((Scenario)d.Scen)
             {
-                case Scenario.FreeFlow: return pref.Dot(g.TimeFree[edge], g.Money[edge], g.Comfort[edge]);
-                case Scenario.Typical: return pref.Dot(g.TimeTypical[edge], g.Money[edge], g.Comfort[edge]);
+                case Scenario.FreeFlow:
+                    return d.PrefT * g.TimeFree[edge] + d.PrefM * g.Money[edge] + d.PrefC * g.Comfort[edge];
+                case Scenario.Typical:
+                    return d.PrefT * g.TimeTypical[edge] + d.PrefM * g.Money[edge] + d.PrefC * g.Comfort[edge];
                 default:
                     float tl = g.TimeLive[edge];
                     // a non-finite live time from a metric feed means impassable —
                     // never let it reach the Dot (0 * inf = NaN poisons customization)
                     if (!float.IsFinite(tl)) return float.PositiveInfinity;
-                    return pref.Dot(tl, g.Money[edge], g.Comfort[edge]) * mult;
+                    return (d.PrefT * tl + d.PrefM * g.Money[edge] + d.PrefC * g.Comfort[edge]) * mult;
             }
         }
 

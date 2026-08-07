@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
 using CS2Path.Core;
 
@@ -55,6 +57,12 @@ namespace CS2Path.Harness
             VerifyEventDrivenBuckets(seed + 13);
             Console.WriteLine("verify: city-export round trip (format + corruption detection)...");
             VerifyCityExport(seed + 15);
+            Console.WriteLine("verify: parallel customization == sequential (bit-identical)...");
+            VerifyParallelCustomization(seed + 18);
+            Console.WriteLine("verify: parallel seeding == managed OriginalArcWeight (bit-identical)...");
+            VerifyParallelSeeding(seed + 19);
+            Console.WriteLine("verify: Burst kernel portability (no managed constructs)...");
+            VerifyBurstKernelPortability();
             Console.WriteLine("verify: spatial nearest-node index vs brute force...");
             VerifySpatialIndex(seed + 16);
             Console.WriteLine("verify: A3 change-locality classifier (pocket vs scattered)...");
@@ -636,6 +644,414 @@ namespace CS2Path.Harness
             try { CityExport.Read(new System.IO.MemoryStream(ms.ToArray(), 0, (int)(ms.Length / 2))); }
             catch (Exception) { truncCaught = true; }
             Check(truncCaught, "truncated export was accepted instead of rejected");
+        }
+
+        private static void VerifyParallelCustomization(ulong seed)
+        {
+            // Bit-identical, not approximately-equal. The claim is that atomic-min
+            // level-parallel customization cannot reorder any float arithmetic:
+            // min is exact and order-independent, and every addend is read from an
+            // arc finalized at a strictly lower level. Exact equality is therefore
+            // the correct assertion, and a tolerance here would hide a real bug.
+            var city = SyntheticCity.Build(48, 48, 2500, 300, seed);
+            var anchors = city.BuildAnchors(8);
+            var eng = RoutingEngine.Build(city.G, anchors);
+            var m = eng.Metrics;
+
+            m.ResetAll();
+            m.FullCustomize();
+            var seqF = (float[])m.WFwd.Clone();
+            var seqB = (float[])m.WBwd.Clone();
+
+            // Several thread counts: a scheduling-order-dependent bug will not
+            // reproduce at every width.
+            foreach (int threads in new[] { 2, 3, 4, 8 })
+            {
+                m.ResetAll();
+                m.FullCustomizeParallel(threads);
+                int mismatches = 0;
+                for (int i = 0; i < seqF.Length; i++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m.WFwd[i]) != BitConverter.SingleToInt32Bits(seqF[i])) mismatches++;
+                    if (BitConverter.SingleToInt32Bits(m.WBwd[i]) != BitConverter.SingleToInt32Bits(seqB[i])) mismatches++;
+                }
+                Check(mismatches == 0, $"parallel customization diverged from sequential on {mismatches} lanes at {threads} threads");
+                // Guard against a VACUOUS pass: if every level of this graph is
+                // narrower than MinLevelNodesToSplit, FullCustomizeParallel runs
+                // fully serially and "bit-identical" proves nothing about the
+                // atomic path. Assert the concurrent path actually executed.
+                Check(m.LastParallelLevelsSplit > 0,
+                    $"parallel path never engaged at {threads} threads — test graph has no level " +
+                    $"≥ {CchMetrics.MinLevelNodesToSplit} nodes, so bit-identity is vacuous");
+                // Task-parallel path: same bit-identity bar, same thread sweep.
+                m.ResetAll();
+                m.FullCustomizeParallelTasks(threads);
+                int taskMismatches = 0;
+                for (int i = 0; i < seqF.Length; i++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m.WFwd[i]) != BitConverter.SingleToInt32Bits(seqF[i])) taskMismatches++;
+                    if (BitConverter.SingleToInt32Bits(m.WBwd[i]) != BitConverter.SingleToInt32Bits(seqB[i])) taskMismatches++;
+                }
+                Check(taskMismatches == 0,
+                    $"TASK-parallel customization diverged from sequential on {taskMismatches} lanes at {threads} threads");
+                Check(m.LastTasksRun >= 2,
+                    $"task-parallel path fell back to sequential at {threads} threads — no frontier");
+
+                // HONESTY LIMIT, measured by adversarial review: this guard shows
+                // the concurrent path RAN, not that any arc was CONTENDED. On
+                // this graph only ~6% of triangles land in splittable levels and
+                // just 6-118 arcs are written from different chunks, so a build
+                // with the atomic min deleted still passes ~199 runs in 200.
+                // Bit-identity here therefore demonstrates the LEVEL SCHEDULE is
+                // sound; it does NOT prove the atomic is necessary or correct.
+                // Contention is asserted separately below, where it can be
+                // counted deterministically rather than raced for.
+            }
+
+            // Levels must actually partition the nodes, or the sweep silently
+            // skips work and still "passes" the equality check above.
+            var c = eng.Skeleton;
+            Check(c.LevelCount > 1, $"degenerate level decomposition ({c.LevelCount} levels)");
+            Check(c.LevelStart[c.LevelCount] == c.NodeCount,
+                $"levels cover {c.LevelStart[c.LevelCount]}/{c.NodeCount} nodes");
+            var seen = new bool[c.NodeCount];
+            int dup = 0;
+            foreach (var v in c.LevelNodes) { if (seen[v]) dup++; seen[v] = true; }
+            Check(dup == 0, $"{dup} nodes appear in more than one level");
+
+            // The load-bearing invariant: a node's elimination-tree parent must
+            // sit at a strictly higher level, else a level could read an arc that
+            // is not yet final and the parallel sweep would be racy-by-design.
+            var lvlOf = new int[c.NodeCount];
+            for (int l = 0; l < c.LevelCount; l++)
+                for (int i = c.LevelStart[l]; i < c.LevelStart[l + 1]; i++) lvlOf[c.LevelNodes[i]] = l;
+            int inversions = 0;
+            for (int v = 0; v < c.NodeCount; v++)
+            {
+                int p = c.EtParent[v];
+                if (p >= 0 && lvlOf[p] <= lvlOf[v]) inversions++;
+            }
+            Check(inversions == 0, $"{inversions} elimination-tree edges do not increase level");
+
+            // THE INVARIANT THE PARALLEL SWEEP ACTUALLY DEPENDS ON, counted
+            // directly instead of raced for. Two claims:
+            //  (a) no arc READ by a level-L node is WRITTEN by a level-L node —
+            //      if this fails the schedule is unsound and no atomic can save
+            //      it, because a reader could see a half-updated input;
+            //  (b) some arc IS written by two different nodes of one level —
+            //      if this never happens the atomic min is dead weight, and any
+            //      bit-identity result says nothing about it.
+            var writerLevel = new int[c.ArcCount];
+            var writerNode = new int[c.ArcCount];
+            for (int i = 0; i < c.ArcCount; i++) { writerLevel[i] = -1; writerNode[i] = -1; }
+            int readWriteConflicts = 0, contendedArcs = 0;
+            for (int lvl = 0; lvl < c.LevelCount; lvl++)
+            {
+                for (int i = c.LevelStart[lvl]; i < c.LevelStart[lvl + 1]; i++)
+                {
+                    int x = c.LevelNodes[i];
+                    int s = c.UpStart[x], e = c.UpStart[x + 1];
+                    for (int p2 = s; p2 < e; p2++)
+                    {
+                        // (a) arcs (x, ·) are this node's INPUTS
+                        if (writerLevel[p2] == lvl) readWriteConflicts++;
+                    }
+                    for (int ii = s; ii < e; ii++)
+                    {
+                        int A = c.UpHead[ii];
+                        int p3 = s, q = c.UpStart[A], qe = c.UpStart[A + 1];
+                        while (p3 < e && q < qe)
+                        {
+                            int hb = c.UpHead[p3], hb2 = c.UpHead[q];
+                            if (hb < hb2) p3++;
+                            else if (hb > hb2) q++;
+                            else
+                            {
+                                if (writerLevel[q] == lvl && writerNode[q] != x) contendedArcs++;
+                                writerLevel[q] = lvl; writerNode[q] = x;
+                                p3++; q++;
+                            }
+                        }
+                    }
+                }
+            }
+            Check(readWriteConflicts == 0,
+                $"UNSOUND SCHEDULE: {readWriteConflicts} arcs are read and written within one level");
+            Check(contendedArcs > 0,
+                "no arc is written by two nodes of the same level on this graph — the atomic min is " +
+                "untested here, so bit-identity cannot be read as evidence for it");
+
+            // ---- Task decomposition (dissection-cell subtrees) ----
+            // Run the full invariant census on TWO graph shapes: the city grid
+            // (geometric partitioner) and a coordinate-less random graph (BFS
+            // embedding + degenerate-guard paths) — adversarial review showed
+            // single-shape coverage leaves whole emission paths untested.
+            CheckTaskInvariants(c, "city-grid");
+            {
+                var rng2 = new SplitMix64(seed + 99);
+                int n2 = 3000, m2 = 12000;
+                var edges2 = new List<(int, int, float, float, float, float)>(m2);
+                for (int i = 0; i < m2; i++)
+                {
+                    int u = rng2.NextInt(n2), v = rng2.NextInt(n2);
+                    if (u == v) { i--; continue; }
+                    edges2.Add((u, v, 1f + 8f * rng2.NextFloat(), rng2.NextFloat(), rng2.NextFloat(), 1f));
+                }
+                var g2 = Graph.Build(n2, edges2); // no coordinates
+                var anchors2 = AnchorGrid.Build(new List<Preference>(), null, 3,
+                    new[] { Scenario.FreeFlow, Scenario.Live });
+                var eng2 = RoutingEngine.Build(g2, anchors2);
+                CheckTaskInvariants(eng2.Skeleton, "bfs-fallback");
+                // one bit-identity run on the second shape too
+                var m2m = eng2.Metrics;
+                m2m.ResetAll(); m2m.FullCustomize();
+                var f2 = (float[])m2m.WFwd.Clone(); var b2 = (float[])m2m.WBwd.Clone();
+                m2m.ResetAll(); m2m.FullCustomizeParallelTasks(4);
+                int mm = 0;
+                for (int i = 0; i < f2.Length; i++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m2m.WFwd[i]) != BitConverter.SingleToInt32Bits(f2[i])) mm++;
+                    if (BitConverter.SingleToInt32Bits(m2m.WBwd[i]) != BitConverter.SingleToInt32Bits(b2[i])) mm++;
+                }
+                Check(mm == 0, $"task-parallel diverged on the BFS-fallback graph ({mm} lanes)");
+            }
+        }
+
+        /// <summary>Deterministic structural invariants of the task frontier.
+        /// Hardened per adversarial review: (a) the write census classifies
+        /// writes with BurstKernels.SharedWrite — the KERNEL's own predicate —
+        /// so an off-by-one there fails here instead of being re-derived away;
+        /// (b) closure is checked over EVERY up-arc, not just EtParent (the
+        /// first ancestor), which also catches cross-task READ races; (c) plain
+        /// and shared writer sets are cross-compared, closing the
+        /// mixed plain/atomic overlap class a graft corruption could hide in.</summary>
+        private static void CheckTaskInvariants(CchSkeleton c, string tag)
+        {
+            var lo = c.TaskLo; var hi = c.TaskHi; var p2r = c.Phase2Ranks;
+            Check(lo != null && hi != null && p2r != null && lo!.Length >= 2,
+                $"[{tag}] task frontier missing or trivial");
+            if (lo == null || hi == null || p2r == null || lo.Length < 2) return;
+
+            // (1) exact partition of rank space
+            var owner = new int[c.NodeCount];
+            for (int r = 0; r < c.NodeCount; r++) owner[r] = -2;
+            int doubleCovered = 0, p2Overlap = 0;
+            for (int t = 0; t < lo.Length; t++)
+                for (int r = lo[t]; r < hi[t]; r++)
+                {
+                    if (owner[r] != -2) doubleCovered++;
+                    owner[r] = t;
+                }
+            foreach (var r in p2r)
+            {
+                if (owner[r] != -2) p2Overlap++;
+                owner[r] = -1;
+            }
+            int uncovered = 0;
+            for (int r = 0; r < c.NodeCount; r++) if (owner[r] == -2) uncovered++;
+            Check(doubleCovered == 0, $"[{tag}] {doubleCovered} ranks covered by two tasks");
+            Check(p2Overlap == 0, $"[{tag}] {p2Overlap} phase-2 ranks overlap a task");
+            Check(uncovered == 0, $"[{tag}] {uncovered} ranks unassigned");
+
+            // (2) FULL up-arc closure: for every in-task node, every up-neighbour
+            // is same-task or phase-2 — the exact premise of ContractNodeBoundary.
+            // Also assert the kernel predicate agrees with task membership in
+            // both directions (catches >= vs > in either place).
+            int closureViolations = 0, predicateDisagreements = 0;
+            int plainRaces = 0, crossTaskContended = 0, mixedRaces = 0;
+            var plainWriter = new int[c.ArcCount];
+            for (int i = 0; i < c.ArcCount; i++) plainWriter[i] = -2;
+            var sharedTasks = new Dictionary<int, int>();
+            for (int t = 0; t < lo.Length; t++)
+            {
+                for (int r = lo[t]; r < hi[t]; r++)
+                {
+                    int x = c.NodeAtRank[r];
+                    int s = c.UpStart[x], e = c.UpStart[x + 1];
+                    for (int ii = s; ii < e; ii++)
+                    {
+                        int A = c.UpHead[ii];
+                        int ra = c.Rank[A];
+                        bool inTask = ra < hi[t] && owner[ra] == t;
+                        bool isP2 = owner[ra] == -1;
+                        if (!inTask && !isP2) closureViolations++;
+                        bool kernelShared = BurstKernels.SharedWrite(ra, hi[t]) != 0;
+                        if (kernelShared == inTask) predicateDisagreements++; // must be opposites
+                        int p3 = s, q = c.UpStart[A], qe = c.UpStart[A + 1];
+                        while (p3 < e && q < qe)
+                        {
+                            int hb = c.UpHead[p3], hb2 = c.UpHead[q];
+                            if (hb < hb2) p3++;
+                            else if (hb > hb2) q++;
+                            else
+                            {
+                                if (!kernelShared)
+                                {
+                                    if (plainWriter[q] == -2) plainWriter[q] = t;
+                                    else if (plainWriter[q] != t) plainRaces++;
+                                }
+                                else
+                                {
+                                    if (sharedTasks.TryGetValue(q, out int t0))
+                                    { if (t0 != t) crossTaskContended++; }
+                                    else sharedTasks[q] = t;
+                                }
+                                p3++; q++;
+                            }
+                        }
+                    }
+                }
+            }
+            foreach (var kv in sharedTasks)
+                if (plainWriter[kv.Key] != -2) mixedRaces++;
+            Check(closureViolations == 0,
+                $"[{tag}] UNSOUND: {closureViolations} up-arcs escape their task without being phase-2");
+            Check(predicateDisagreements == 0,
+                $"[{tag}] kernel SharedWrite predicate disagrees with task membership on {predicateDisagreements} arcs");
+            Check(plainRaces == 0,
+                $"[{tag}] UNSOUND: {plainRaces} arcs plain-written by two tasks");
+            Check(mixedRaces == 0,
+                $"[{tag}] UNSOUND: {mixedRaces} arcs both plain-written and atomically written by different tasks");
+            Check(crossTaskContended > 0,
+                $"[{tag}] no cross-task boundary contention — atomic path untested on this graph");
+        }
+
+        private static void VerifyParallelSeeding(ulong seed)
+        {
+            // The seeding kernel replicates AnchorGrid.EdgeWeight expression-
+            // for-expression; this pins the two implementations bit-identical
+            // so they cannot drift apart. Exercised across all three scenarios
+            // (free-flow, typical, live), non-trivial live times, closure
+            // multipliers including +inf, a non-finite live time, and parallel
+            // edges (the CSR-flattened overflow path).
+            // Random graph with DELIBERATE parallel edges (SyntheticCity emits
+            // none, which would leave the CSR overflow path unexercised — the
+            // guard below enforces this).
+            var rng = new SplitMix64(seed);
+            int n = 1500, mEdges = 6000;
+            var edges = new List<(int, int, float, float, float, float)>(mEdges + 400);
+            for (int i = 0; i < mEdges; i++)
+            {
+                int u = rng.NextInt(n), v = rng.NextInt(n);
+                if (u == v) { i--; continue; }
+                edges.Add((u, v, 1f + 9f * rng.NextFloat(), rng.NextFloat(), rng.NextFloat(), 1f));
+            }
+            for (int i = 0; i < 400; i++) // duplicates of existing pairs = parallel edges
+            {
+                var (u, v, _, _, _, _) = edges[rng.NextInt(mEdges)];
+                edges.Add((u, v, 1f + 9f * rng.NextFloat(), rng.NextFloat(), rng.NextFloat(), 1f));
+            }
+            var g = Graph.Build(n, edges);
+            for (int i = 0; i < g.EdgeCount; i++)
+                g.TimeLive[i] = g.TimeFree[i] * (0.6f + 2.0f * rng.NextFloat());
+            for (int i = 0; i < 60; i++) g.ClosureMult[rng.NextInt(g.EdgeCount)] = 1.2f + rng.NextFloat();
+            for (int i = 0; i < 15; i++) g.ClosureMult[rng.NextInt(g.EdgeCount)] = float.PositiveInfinity;
+            g.TimeLive[rng.NextInt(g.EdgeCount)] = float.PositiveInfinity;
+            g.TimeLive[rng.NextInt(g.EdgeCount)] = float.NaN;
+
+            var anchors = AnchorGrid.Build(new List<Preference>(), null, 4,
+                new[] { Scenario.FreeFlow, Scenario.Typical, Scenario.Live }, seed);
+            var rank = NestedDissection.ComputeOrder(g, out _);
+            var c = CchSkeleton.Build(g, rank);
+            var m = CchMetrics.Create(c, anchors);
+            m.ResetAll(); // parallel kernel path
+
+            int bad = 0;
+            for (int a = 0; a < c.ArcCount; a++)
+                for (int k = 0; k < m.K; k++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m.WFwd[a * m.K + k]) !=
+                        BitConverter.SingleToInt32Bits(m.OriginalArcWeight(a, k, true))) bad++;
+                    if (BitConverter.SingleToInt32Bits(m.WBwd[a * m.K + k]) !=
+                        BitConverter.SingleToInt32Bits(m.OriginalArcWeight(a, k, false))) bad++;
+                }
+            Check(bad == 0, $"seeding kernel diverged from managed OriginalArcWeight on {bad} lanes");
+            Check(c.ExtraFwd.Count + c.ExtraBwd.Count > 0,
+                "no parallel edges present — the CSR overflow path went unexercised");
+        }
+
+        private static void VerifyBurstKernelPortability()
+        {
+            // Burst rejects every managed construct. Rather than discover that
+            // during an in-game build (where the toolchain is not available to us
+            // here), assert it against the kernel source directly, so the property
+            // is checked on every run of the suite.
+            string path = FindRepoFile("src/CS2Path.Core/BurstKernels.cs");
+            Check(path != null, "BurstKernels.cs not found for portability lint");
+            if (path == null) return;
+            var lines = File.ReadAllLines(path);
+
+            // Constructs Burst cannot compile. Deliberately matched on code only:
+            // comments explain WHY these are banned and must not trip the lint.
+            var banned = new (string pattern, string why)[]
+            {
+                ("System.Numerics", ".NET SIMD is invisible to Burst"),
+                ("List<", "managed collection"),
+                ("Dictionary<", "managed collection"),
+                ("string ", "managed type"),
+                ("new ", "allocation"),
+                ("throw ", "Burst has no managed exceptions"),
+                ("try", "no exception handling under Burst"),
+                ("foreach", "iterators allocate/box"),
+                ("class ", "reference type"),
+                ("delegate", "function pointers only"),
+                ("Console.", "no managed IO"),
+                ("Math.", "use branchless/intrinsic forms; Burst prefers its own math"),
+                ("[]", "managed array"),
+            };
+            // `static class` is REQUIRED, not forbidden: Burst compiles static
+            // methods, which must live in a static class or struct. Only a
+            // non-static (instantiable, reference-type) class is a violation.
+            bool BannedHere(string code, string pat)
+            {
+                if (pat != "class ") return code.Contains(pat);
+                int at = code.IndexOf("class ", StringComparison.Ordinal);
+                if (at < 0) return false;
+                return !code.Substring(0, at).Contains("static");
+            }
+            int violations = 0;
+            var detail = new List<string>();
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string raw = lines[i];
+                string code = raw;
+                int slash = code.IndexOf("//", StringComparison.Ordinal);
+                if (slash >= 0) code = code.Substring(0, slash);
+                string t = code.TrimStart();
+                if (t.StartsWith("*") || t.StartsWith("///")) continue; // doc comment body
+                foreach (var (pat, why) in banned)
+                {
+                    if (BannedHere(code, pat))
+                    {
+                        violations++;
+                        detail.Add($"L{i + 1}: '{pat}' ({why})");
+                    }
+                }
+            }
+            Check(violations == 0,
+                $"BurstKernels.cs contains {violations} Burst-hostile construct(s): {string.Join("; ", detail.Take(6))}");
+
+            // And it must genuinely be the code the engine runs, not a dead
+            // parallel copy that drifts out of sync.
+            string metrics = FindRepoFile("src/CS2Path.Core/CchMetrics.cs");
+            if (metrics != null)
+            {
+                string src = File.ReadAllText(metrics);
+                Check(src.Contains("BurstKernels.FullCustomizeRange"), "FullCustomize no longer routes through the kernel");
+                Check(src.Contains("BurstKernels.ContractLevelRange"), "parallel sweep no longer routes through the kernel");
+                Check(!src.Contains("System.Numerics"), "CchMetrics still imports .NET SIMD");
+            }
+        }
+
+        private static string? FindRepoFile(string rel)
+        {
+            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            for (int i = 0; i < 8 && dir != null; i++, dir = dir.Parent)
+            {
+                string p = Path.Combine(dir.FullName, rel);
+                if (File.Exists(p)) return p;
+            }
+            return null;
         }
 
         private static void VerifySpatialIndex(ulong seed)

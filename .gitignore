@@ -10,3 +10,5 @@ deploy/gcp/*.tfstate
 deploy/gcp/*.tfstate.*
 deploy/gcp/*.tfvars
 deploy/gcp/tfplan
+results-bench.md
+results-import*.md

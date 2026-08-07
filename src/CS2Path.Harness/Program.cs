@@ -273,6 +273,102 @@ namespace CS2Path.Harness
             eng.Metrics.FullCustomize();
             double fullMs = sw.Elapsed.TotalMilliseconds;
 
+            // Level-parallel A/B. Out of game this measures the SCHEDULE, not
+            // Burst codegen: same kernel, same arithmetic, dispatched across
+            // elimination-tree levels. In-game the identical decomposition
+            // becomes one IJobParallelFor per level and additionally gets
+            // Burst's vectorizer, so this ratio is a floor on the in-game win,
+            // not an estimate of it.
+            // Split the two halves of "customization". ResetAll seeds every arc
+            // lane from its original edge weight; FullCustomize is the triangle
+            // sweep. They have completely different bottlenecks — seeding is
+            // scattered random access over edge attributes, the sweep is a
+            // streaming min-plus pass — so a single combined number hides which
+            // one any given change actually moved.
+            var resetMs = new List<double>();
+            var sweepMs = new List<double>();
+            for (int rep = 0; rep < 5; rep++)
+            {
+                sw.Restart();
+                eng.Metrics.ResetAll();
+                resetMs.Add(sw.Elapsed.TotalMilliseconds);
+                sw.Restart();
+                eng.Metrics.FullCustomize();
+                sweepMs.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            resetMs.Sort(); sweepMs.Sort();
+            double resetMed = resetMs[resetMs.Count / 2], sweepMed = sweepMs[sweepMs.Count / 2];
+            Console.WriteLine($"  split: ResetAll median {resetMed:N0} ms (spread {resetMs[0]:N0}-{resetMs[resetMs.Count - 1]:N0}) | " +
+                              $"sweep median {sweepMed:N0} ms (spread {sweepMs[0]:N0}-{sweepMs[sweepMs.Count - 1]:N0})");
+
+            // Thread scaling, not just a single parallel number: if the sweep is
+            // memory-bandwidth-bound rather than compute-bound, time flattens
+            // early and no decomposition will fix it. That distinction decides
+            // whether the remaining in-game win comes from more threads or from
+            // Burst's codegen and tighter data layout, so it is worth measuring
+            // rather than assuming.
+            // APPLES TO APPLES. Two earlier bugs made every ratio in this
+            // section wrong, both found by adversarial review:
+            //  (1) the numerator was fullMs, which includes ResetAll (~190 ms),
+            //      while the parallel timings exclude it — inflating every
+            //      speedup by roughly that ratio;
+            //  (2) threads==1 routes 100% of the work through the fast
+            //      non-atomic kernel while threads>=2 sends ~95% of it through
+            //      the ~2x slower atomic kernel, so a 1t-vs-2t "scaling" curve
+            //      compared two different computations.
+            // The baseline is therefore the SWEEP ONLY (sweepMed, rank order),
+            // and each parallel point is reported against it.
+            var scaling = new List<(int t, double ms)>();
+            foreach (int t in new[] { 1, 2, 4, Environment.ProcessorCount })
+            {
+                if (scaling.Exists(s => s.t == t)) continue;
+                var reps = new List<double>();
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    eng.Metrics.ResetAll();           // outside the stopwatch, as before
+                    sw.Restart();
+                    eng.Metrics.FullCustomizeParallel(t);
+                    reps.Add(sw.Elapsed.TotalMilliseconds);
+                }
+                reps.Sort();
+                scaling.Add((t, reps[reps.Count / 2]));
+            }
+            double fullParMs = scaling[scaling.Count - 1].ms;
+            string scalingStr = string.Join(", ", scaling.ConvertAll(s =>
+                $"{s.t}t={s.ms:N0}ms({sweepMed / Math.Max(0.001, s.ms):0.00}x)"));
+            Console.WriteLine($"  sweep baseline (rank order, non-atomic) {sweepMed:N0} ms | level-parallel {scalingStr} " +
+                              $"| {eng.Skeleton.LevelCount} levels, {Environment.ProcessorCount} cores");
+            Console.WriteLine($"  NOTE: 1t uses the non-atomic kernel; 2t+ uses the atomic kernel for " +
+                              $"~95% of triangles, so 1t is NOT the same computation as 2t+.");
+
+            // Task decomposition (dissection-cell subtrees): rank-order inside
+            // each task, atomics only on enclosing-separator writes.
+            var taskScaling = new List<(int t, double ms)>();
+            foreach (int t in new[] { 1, 2, 4, Environment.ProcessorCount })
+            {
+                if (taskScaling.Exists(s => s.t == t)) continue;
+                var reps = new List<double>();
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    eng.Metrics.ResetAll();
+                    sw.Restart();
+                    eng.Metrics.FullCustomizeParallelTasks(t);
+                    reps.Add(sw.Elapsed.TotalMilliseconds);
+                }
+                reps.Sort();
+                taskScaling.Add((t, reps[reps.Count / 2]));
+            }
+            double fullTaskMs = taskScaling[taskScaling.Count - 1].ms;
+            string taskStr = string.Join(", ", taskScaling.ConvertAll(s =>
+                $"{s.t}t={s.ms:N0}ms({sweepMed / Math.Max(0.001, s.ms):0.00}x)"));
+            int nT = eng.Skeleton.TaskLo?.Length ?? 0;
+            int p2 = eng.Skeleton.Phase2Ranks?.Length ?? 0;
+            Console.WriteLine($"  task-parallel {taskStr} | {nT} tasks + {p2} phase-2 separator nodes");
+            // Leave the engine in the canonical sequential state for everything
+            // that follows, so no later measurement inherits the parallel run.
+            eng.Metrics.ResetAll();
+            eng.Metrics.FullCustomize();
+
             // Typical congestion deltas: ±10% multiplicative drift on the live
             // time of spatially random edges — what a 3%-threshold EMA feed
             // produces each refresh. One large-shock round is reported
@@ -344,7 +440,8 @@ namespace CS2Path.Harness
             sb.AppendLine();
             sb.AppendLine("| operation | time | §6 target |");
             sb.AppendLine("|---|---|---|");
-            sb.AppendLine($"| full customization, all {K} metrics | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
+            sb.AppendLine($"| full customization, all {K} metrics (sequential) | {fullMs:N0} ms | < 10 ms (Burst/SIMD budget) |");
+            sb.AppendLine($"| full customization, level-parallel thread scaling ({eng.Skeleton.LevelCount} levels) | {scalingStr} | flattening ⇒ bandwidth-bound, not thread-starved |");
             sb.AppendLine($"| partial, 100 edges ±10% drift, scattered (live lanes) | median {Pct(partial100, 0.5):0.00} ms, p99 {Pct(partial100, 0.99):0.00} ms ({arcs100 / Rounds:N0} arcs) | < 1 ms |");
             sb.AppendLine($"| partial, 150 edges ±10% drift, clustered (one congestion pocket) | median {Pct(partialClustered, 0.5):0.00} ms, p99 {Pct(partialClustered, 0.99):0.00} ms ({arcsClustered / Rounds:N0} arcs) | < 1 ms |");
             sb.AppendLine($"| partial, 1000 edges ±10% drift, scattered (live lanes) | median {Pct(partial1000, 0.5):0.00} ms, p99 {Pct(partial1000, 0.99):0.00} ms ({arcs1000 / Rounds:N0} arcs) | — |");

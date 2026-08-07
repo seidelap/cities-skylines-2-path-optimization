@@ -1,0 +1,410 @@
+using System.Threading;
+
+namespace CS2Path.Core
+{
+    /// <summary>
+    /// The hot inner loops, written so that ONE implementation compiles under
+    /// both toolchains: Roslyn for the out-of-game harness, and Unity's Burst
+    /// when the mod ships inside the game.
+    ///
+    /// WHY POINTERS. Burst rejects every managed type — no classes, no <c>T[]</c>,
+    /// no <c>List</c>/<c>Dictionary</c>, no strings, no delegates, no exceptions
+    /// carrying messages, no boxing. In-game the buffers are
+    /// <c>NativeArray&lt;T&gt;</c>; out-of-game they are ordinary C# arrays. The
+    /// ONLY representation common to both is a raw pointer plus an explicit
+    /// length, so that is the calling convention. The harness pins arrays with
+    /// <c>fixed</c>; a Burst job passes <c>NativeArray.GetUnsafePtr()</c>. Neither
+    /// side needs the other's container type, which is what lets CS2Path.Core keep
+    /// its hard rule of ZERO game-assembly references (plan §5).
+    ///
+    /// RULES FOR THIS FILE (enforced by a linter in the verify suite — see
+    /// TestRunner.VerifyBurstKernelPortability):
+    ///   * static methods only, no instance state, no mutable statics
+    ///   * parameters and locals are primitives, pointers, or unmanaged structs
+    ///   * no allocation of any kind on any path
+    ///   * no System.Numerics (that is .NET SIMD; Burst uses its own vectorizer)
+    ///   * no try/catch, no throw, no string formatting
+    ///
+    /// VECTORIZATION. The previous implementation used
+    /// <c>System.Numerics.Vector&lt;float&gt;</c>, which Burst cannot see. These
+    /// loops are instead written as a 4-wide unrolled scalar form over the
+    /// lane-contiguous (arc-major) layout. Both RyuJIT and Burst auto-vectorize
+    /// that shape, and under Burst it maps onto the same <c>float4</c> registers
+    /// Unity.Mathematics would have produced — without Core naming a Unity type.
+    /// </summary>
+    public static unsafe class BurstKernels
+    {
+        /// <summary>
+        /// Relax one triangle (x, A, B) into the target arc t = (A, B).
+        /// Forward: A → x → B improves WFwd[t]. Backward: B → x → A improves WBwd[t].
+        /// b1/b2/bt are lane-base offsets (arc * K) for arcs (x,A), (x,B) and t.
+        ///
+        /// Sequential form: safe only when no other thread writes lane range
+        /// [bt, bt+K). Used by the single-threaded sweep and by any parallel
+        /// scheme that partitions by target arc.
+        /// </summary>
+        public static void RelaxTriangle(float* wFwd, float* wBwd, int b1, int b2, int bt, int K)
+        {
+            int k = 0;
+            // Select + UNCONDITIONAL store, not a predicated store: adversarial
+            // review pointed out that `if (f < t) t = f` is a shape neither
+            // LLVM (Burst) nor RyuJIT will vectorize — a store under a branch
+            // cannot become a packed min. `t = f < t ? f : t` is a select and
+            // maps directly onto vminps. Result bits are identical: when the
+            // candidate does not improve, the same value is stored back.
+            for (; k <= K - 4; k += 4)
+            {
+                float t0 = wFwd[bt + k + 0], t1 = wFwd[bt + k + 1], t2 = wFwd[bt + k + 2], t3 = wFwd[bt + k + 3];
+                float f0 = wBwd[b1 + k + 0] + wFwd[b2 + k + 0];
+                float f1 = wBwd[b1 + k + 1] + wFwd[b2 + k + 1];
+                float f2 = wBwd[b1 + k + 2] + wFwd[b2 + k + 2];
+                float f3 = wBwd[b1 + k + 3] + wFwd[b2 + k + 3];
+                wFwd[bt + k + 0] = f0 < t0 ? f0 : t0;
+                wFwd[bt + k + 1] = f1 < t1 ? f1 : t1;
+                wFwd[bt + k + 2] = f2 < t2 ? f2 : t2;
+                wFwd[bt + k + 3] = f3 < t3 ? f3 : t3;
+
+                float u0 = wBwd[bt + k + 0], u1 = wBwd[bt + k + 1], u2 = wBwd[bt + k + 2], u3 = wBwd[bt + k + 3];
+                float g0 = wBwd[b2 + k + 0] + wFwd[b1 + k + 0];
+                float g1 = wBwd[b2 + k + 1] + wFwd[b1 + k + 1];
+                float g2 = wBwd[b2 + k + 2] + wFwd[b1 + k + 2];
+                float g3 = wBwd[b2 + k + 3] + wFwd[b1 + k + 3];
+                wBwd[bt + k + 0] = g0 < u0 ? g0 : u0;
+                wBwd[bt + k + 1] = g1 < u1 ? g1 : u1;
+                wBwd[bt + k + 2] = g2 < u2 ? g2 : u2;
+                wBwd[bt + k + 3] = g3 < u3 ? g3 : u3;
+            }
+            for (; k < K; k++)
+            {
+                float t = wFwd[bt + k];
+                float f = wBwd[b1 + k] + wFwd[b2 + k];
+                wFwd[bt + k] = f < t ? f : t;
+                float u = wBwd[bt + k];
+                float b = wBwd[b2 + k] + wFwd[b1 + k];
+                wBwd[bt + k] = b < u ? b : u;
+            }
+        }
+
+        /// <summary>
+        /// Atomic variant, for level-parallel customization. Two nodes eliminated
+        /// in the same elimination-tree level can target the SAME arc, so the
+        /// read-modify-write must not race.
+        ///
+        /// Still bit-identical to the sequential sweep: min is commutative and
+        /// associative and introduces no rounding, and every addend is read from
+        /// an arc already finalized at a strictly lower level. So the final value
+        /// is the min over the same multiset of candidates regardless of the
+        /// order threads happen to apply them.
+        /// </summary>
+        public static void RelaxTriangleAtomic(float* wFwd, float* wBwd, int b1, int b2, int bt, int K)
+        {
+            // Measured: this path is ~2x slower per triangle than RelaxTriangle,
+            // and since ~95% of triangle work lands in splittable levels, that
+            // factor — NOT cache-line contention — is what caps level-parallel
+            // scaling. (Adversarial review established this directly: the same
+            // schedule and chunking with the atomic removed scales 1.98x at two
+            // threads, while 64-byte alignment moves it under 1%.)
+            //
+            // So the shape matters. The 4-wide block below mirrors the
+            // non-atomic kernel's form: compute four candidates, test all four
+            // with plain loads, and pay a CAS only on lanes that actually
+            // improve. A stale load is safe — it can only be pessimistic
+            // (another thread may have lowered the slot since), and AtomicMin
+            // re-validates under the compare-and-swap.
+            int k = 0;
+            for (; k <= K - 4; k += 4)
+            {
+                float f0 = wBwd[b1 + k + 0] + wFwd[b2 + k + 0];
+                float f1 = wBwd[b1 + k + 1] + wFwd[b2 + k + 1];
+                float f2 = wBwd[b1 + k + 2] + wFwd[b2 + k + 2];
+                float f3 = wBwd[b1 + k + 3] + wFwd[b2 + k + 3];
+                if (f0 < wFwd[bt + k + 0]) AtomicMin(wFwd + bt + k + 0, f0);
+                if (f1 < wFwd[bt + k + 1]) AtomicMin(wFwd + bt + k + 1, f1);
+                if (f2 < wFwd[bt + k + 2]) AtomicMin(wFwd + bt + k + 2, f2);
+                if (f3 < wFwd[bt + k + 3]) AtomicMin(wFwd + bt + k + 3, f3);
+
+                float g0 = wBwd[b2 + k + 0] + wFwd[b1 + k + 0];
+                float g1 = wBwd[b2 + k + 1] + wFwd[b1 + k + 1];
+                float g2 = wBwd[b2 + k + 2] + wFwd[b1 + k + 2];
+                float g3 = wBwd[b2 + k + 3] + wFwd[b1 + k + 3];
+                if (g0 < wBwd[bt + k + 0]) AtomicMin(wBwd + bt + k + 0, g0);
+                if (g1 < wBwd[bt + k + 1]) AtomicMin(wBwd + bt + k + 1, g1);
+                if (g2 < wBwd[bt + k + 2]) AtomicMin(wBwd + bt + k + 2, g2);
+                if (g3 < wBwd[bt + k + 3]) AtomicMin(wBwd + bt + k + 3, g3);
+            }
+            for (; k < K; k++)
+            {
+                float f = wBwd[b1 + k] + wFwd[b2 + k];
+                if (f < wFwd[bt + k]) AtomicMin(wFwd + bt + k, f);
+                float b = wBwd[b2 + k] + wFwd[b1 + k];
+                if (b < wBwd[bt + k]) AtomicMin(wBwd + bt + k, b);
+            }
+        }
+
+        /// <summary>
+        /// Lock-free float min via integer CAS. Valid because every weight here
+        /// is non-negative or +inf, and for non-negative IEEE-754 floats the bit
+        /// patterns order identically to their signed-integer reinterpretation.
+        /// NaN never reaches this path — AnchorGrid short-circuits non-finite
+        /// inputs to +inf before customization sees them.
+        /// </summary>
+        public static void AtomicMin(float* slot, float candidate)
+        {
+            int* asInt = (int*)slot;
+            int candBits = *(int*)&candidate;
+            while (true)
+            {
+                int oldBits = *asInt;
+                float oldVal = *(float*)&oldBits;
+                if (!(candidate < oldVal)) return;              // already better (or NaN-safe no-op)
+                if (Interlocked.CompareExchange(ref *asInt, candBits, oldBits) == oldBits) return;
+            }
+        }
+
+        /// <summary>
+        /// Eliminate one node: relax every triangle (x, A, B) formed by pairs of
+        /// x's up-neighbours. Merge-scans Up[x] against Up[A] by head id, which is
+        /// why both lists must stay sorted by head.
+        ///
+        /// This is the body of the full-customization outer loop, lifted so that
+        /// the sequential sweep, the parallel level sweep, and an in-game
+        /// IJobParallelFor can all share exactly one copy of the logic.
+        /// </summary>
+        public static void ContractNode(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int x, int K, byte atomic)
+        {
+            int s = upStart[x], e = upStart[x + 1];
+            for (int i = s; i < e; i++)
+            {
+                int a = upHead[i];
+                int p = s, q = upStart[a], qe = upStart[a + 1];
+                while (p < e && q < qe)
+                {
+                    int hb = upHead[p], hb2 = upHead[q];
+                    if (hb < hb2) { p++; }
+                    else if (hb > hb2) { q++; }
+                    else
+                    {
+                        if (atomic != 0) RelaxTriangleAtomic(wFwd, wBwd, i * K, p * K, q * K, K);
+                        else RelaxTriangle(wFwd, wBwd, i * K, p * K, q * K, K);
+                        p++; q++;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sequential full customization over a rank range — the whole Layer-1
+        /// sweep with zero managed types touched.
+        /// </summary>
+        public static void FullCustomizeRange(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int* nodeAtRank,
+            int rankFrom, int rankTo, int K)
+        {
+            for (int r = rankFrom; r < rankTo; r++)
+                ContractNode(wFwd, wBwd, upStart, upHead, nodeAtRank[r], K, 0);
+        }
+
+        /// <summary>
+        /// Contract one node under the TASK decomposition: writes are atomic
+        /// only when the target arc's tail lies OUTSIDE the running task's rank
+        /// range (rank[A] &gt;= boundaryRank).
+        ///
+        /// Why this is sufficient: a task is a dissection-cell subtree = a
+        /// contiguous, downward-closed rank range [lo, hi). For x in the task,
+        /// every up-neighbour A of x is an elimination-tree ancestor of x, so A
+        /// is either inside the same task (rank &lt; hi) or a separator of an
+        /// ENCLOSING cell (rank &gt;= hi) — never inside a sibling task. If A is
+        /// in-task, no other task can target arc (A, B) at all (A is not an
+        /// ancestor of any other task's node), so the plain vectorizable write
+        /// is safe. If A is outside, sibling tasks under the same separators may
+        /// target (A, B) concurrently, so the write must be an atomic min.
+        /// Reads are always safe: a contraction reads only arcs with tail x,
+        /// which are written exclusively by x's own descendants — all inside
+        /// this task by downward closure.
+        ///
+        /// The decision is per up-neighbour, not per triangle: one rank load
+        /// and compare per arc of Up[x].
+        /// </summary>
+        /// <summary>The task scheme's write-classification predicate: shared
+        /// (atomic) iff the target arc's tail lies at or above the task's end
+        /// rank. A single definition on purpose — the verify suite's
+        /// deterministic census calls THIS method rather than re-deriving the
+        /// rule, so an off-by-one here fails the suite instead of silently
+        /// weakening the atomic coverage (adversarial review showed a re-derived
+        /// predicate made a &gt;=/&gt; bug undetectable).</summary>
+        public static byte SharedWrite(int rankA, int boundaryRank)
+            => rankA >= boundaryRank ? (byte)1 : (byte)0;
+
+        public static void ContractNodeBoundary(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int* rank,
+            int x, int K, int boundaryRank)
+        {
+            int s = upStart[x], e = upStart[x + 1];
+            for (int i = s; i < e; i++)
+            {
+                int a = upHead[i];
+                byte shared = SharedWrite(rank[a], boundaryRank);
+                int p = s, q = upStart[a], qe = upStart[a + 1];
+                while (p < e && q < qe)
+                {
+                    int hb = upHead[p], hb2 = upHead[q];
+                    if (hb < hb2) { p++; }
+                    else if (hb > hb2) { q++; }
+                    else
+                    {
+                        if (shared != 0) RelaxTriangleAtomic(wFwd, wBwd, i * K, p * K, q * K, K);
+                        else RelaxTriangle(wFwd, wBwd, i * K, p * K, q * K, K);
+                        p++; q++;
+                    }
+                }
+            }
+        }
+
+        /// <summary>One whole task: the sequential rank-order sweep over the
+        /// task's contiguous range, boundary-aware. This preserves the
+        /// sequential kernel's traversal order INSIDE the task, which is where
+        /// the level decomposition was paying its 38% locality tax.</summary>
+        public static void CustomizeTaskRange(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int* nodeAtRank, int* rank,
+            int rankFrom, int rankTo, int K)
+        {
+            for (int r = rankFrom; r < rankTo; r++)
+                ContractNodeBoundary(wFwd, wBwd, upStart, upHead, rank, nodeAtRank[r], K, rankTo);
+        }
+
+        /// <summary>
+        /// One level of the parallel sweep: eliminate the nodes listed in
+        /// levelNodes[from..to). Callers must complete a level before starting the
+        /// next; within a level, order is irrelevant (see RelaxTriangleAtomic).
+        /// In-game this is the Execute body of an IJobParallelFor.
+        ///
+        /// atomic MUST be 1 whenever another thread is working the same level
+        /// concurrently, and SHOULD be 0 when this range is the whole level and
+        /// is being run by one thread. Road-network elimination trees are deep
+        /// and narrow — 331 levels averaging ~400 nodes at 131k — so most levels
+        /// are executed serially, and forcing the atomic path on them paid CAS
+        /// cost for parallelism that was never happening. That alone made the
+        /// first parallel implementation SLOWER than sequential (0.8x).
+        /// </summary>
+        public static void ContractLevelRange(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int* levelNodes,
+            int from, int to, int K, byte atomic)
+        {
+            for (int i = from; i < to; i++)
+                ContractNode(wFwd, wBwd, upStart, upHead, levelNodes[i], K, atomic);
+        }
+
+        /// <summary>
+        /// Everything the seeding pass reads, as raw pointers. Grouped in a
+        /// struct so the call site stays legible; contains no arrays and no
+        /// managed types, so it passes the portability lint and can cross into
+        /// a Burst job by value.
+        /// </summary>
+        public struct SeedContext
+        {
+            public float* WFwd, WBwd;
+            public float* TimeFree, TimeTypical, TimeLive, Money, Comfort, ClosureMult;
+            public AnchorGrid.MetricDesc* Desc;
+            public int* OrigFwd, OrigBwd;
+            // Parallel-edge overflow, flattened to CSR (the managed original is
+            // a Dictionary, which no kernel may touch).
+            public int* ExtraFwdStart, ExtraFwdEdge, ExtraBwdStart, ExtraBwdEdge;
+            public int K;
+        }
+
+        /// <summary>
+        /// One original-edge weight under one lane — the kernel twin of
+        /// AnchorGrid.EdgeWeight, replicated EXPRESSION-FOR-EXPRESSION in the
+        /// same evaluation order so seeding stays bit-identical to the managed
+        /// path (which remains in use by partial customization's RecomputeArc).
+        /// Scenario codes: 0 = FreeFlow, 1 = Typical, else Live.
+        /// Finiteness is tested with pure comparisons (NaN fails both) because
+        /// kernels avoid library calls.
+        /// </summary>
+        public static float SeedEdgeWeight(in SeedContext c, int edge, int k)
+        {
+            float mult = c.ClosureMult[edge];
+            if (mult == float.PositiveInfinity) return float.PositiveInfinity;
+            AnchorGrid.MetricDesc d = c.Desc[k];
+            if (d.Scen == 0)
+                return d.PrefT * c.TimeFree[edge] + d.PrefM * c.Money[edge] + d.PrefC * c.Comfort[edge];
+            if (d.Scen == 1)
+                return d.PrefT * c.TimeTypical[edge] + d.PrefM * c.Money[edge] + d.PrefC * c.Comfort[edge];
+            float tl = c.TimeLive[edge];
+            if (!(tl < float.PositiveInfinity) || !(tl > float.NegativeInfinity))
+                return float.PositiveInfinity;
+            return (d.PrefT * tl + d.PrefM * c.Money[edge] + d.PrefC * c.Comfort[edge]) * mult;
+        }
+
+        /// <summary>
+        /// Seed arcs [arcFrom, arcTo) for lanes [kFrom, kFrom+kCount):
+        /// original-edge weight (+inf for pure shortcuts) min-ed over parallel
+        /// edges. Embarrassingly parallel — each arc's lanes depend only on
+        /// that arc's own original edges, so callers may split the arc range
+        /// across threads with no synchronization of any kind.
+        /// </summary>
+        public static void SeedArcs(in SeedContext c, int arcFrom, int arcTo, int kFrom, int kCount)
+        {
+            for (int a = arcFrom; a < arcTo; a++)
+            {
+                int baseA = a * c.K;
+                int ef = c.OrigFwd[a], eb = c.OrigBwd[a];
+                for (int k = kFrom; k < kFrom + kCount; k++)
+                {
+                    float wf = ef < 0 ? float.PositiveInfinity : SeedEdgeWeight(in c, ef, k);
+                    for (int x = c.ExtraFwdStart[a]; x < c.ExtraFwdStart[a + 1]; x++)
+                    {
+                        float w2 = SeedEdgeWeight(in c, c.ExtraFwdEdge[x], k);
+                        if (w2 < wf) wf = w2;
+                    }
+                    c.WFwd[baseA + k] = wf;
+
+                    float wb = eb < 0 ? float.PositiveInfinity : SeedEdgeWeight(in c, eb, k);
+                    for (int x = c.ExtraBwdStart[a]; x < c.ExtraBwdStart[a + 1]; x++)
+                    {
+                        float w2 = SeedEdgeWeight(in c, c.ExtraBwdEdge[x], k);
+                        if (w2 < wb) wb = w2;
+                    }
+                    c.WBwd[baseA + k] = wb;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Min-plus fold of one arc's lower triangles into scratch lanes — the
+        /// inner loop of partial customization's RecomputeArc.
+        /// </summary>
+        public static void FoldLowerTriangle(
+            float* wFwd, float* wBwd, float* scratchF, float* scratchB,
+            int bv, int bw, int kCount)
+        {
+            for (int k = 0; k < kCount; k++)
+            {
+                float f = wBwd[bv + k] + wFwd[bw + k];   // v -> x -> w
+                if (f < scratchF[k]) scratchF[k] = f;
+                float b = wBwd[bw + k] + wFwd[bv + k];   // w -> x -> v
+                if (b < scratchB[k]) scratchB[k] = b;
+            }
+        }
+
+        /// <summary>
+        /// Commit recomputed lanes back to an arc; returns 1 if any lane moved.
+        /// Exact inequality on purpose: partial customization's propagation
+        /// termination depends on "changed" meaning bitwise-different, not
+        /// approximately-different.
+        /// </summary>
+        public static int CommitArc(
+            float* wFwd, float* wBwd, float* scratchF, float* scratchB, int ba, int kCount)
+        {
+            int changed = 0;
+            for (int k = 0; k < kCount; k++)
+            {
+                if (wFwd[ba + k] != scratchF[k]) { wFwd[ba + k] = scratchF[k]; changed = 1; }
+                if (wBwd[ba + k] != scratchB[k]) { wBwd[ba + k] = scratchB[k]; changed = 1; }
+            }
+            return changed;
+        }
+
+    }
+}
