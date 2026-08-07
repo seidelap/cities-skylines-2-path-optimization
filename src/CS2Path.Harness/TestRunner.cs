@@ -59,6 +59,8 @@ namespace CS2Path.Harness
             VerifyCityExport(seed + 15);
             Console.WriteLine("verify: parallel customization == sequential (bit-identical)...");
             VerifyParallelCustomization(seed + 18);
+            Console.WriteLine("verify: parallel seeding == managed OriginalArcWeight (bit-identical)...");
+            VerifyParallelSeeding(seed + 19);
             Console.WriteLine("verify: Burst kernel portability (no managed constructs)...");
             VerifyBurstKernelPortability();
             Console.WriteLine("verify: spatial nearest-node index vs brute force...");
@@ -912,6 +914,60 @@ namespace CS2Path.Harness
                 $"[{tag}] UNSOUND: {mixedRaces} arcs both plain-written and atomically written by different tasks");
             Check(crossTaskContended > 0,
                 $"[{tag}] no cross-task boundary contention — atomic path untested on this graph");
+        }
+
+        private static void VerifyParallelSeeding(ulong seed)
+        {
+            // The seeding kernel replicates AnchorGrid.EdgeWeight expression-
+            // for-expression; this pins the two implementations bit-identical
+            // so they cannot drift apart. Exercised across all three scenarios
+            // (free-flow, typical, live), non-trivial live times, closure
+            // multipliers including +inf, a non-finite live time, and parallel
+            // edges (the CSR-flattened overflow path).
+            // Random graph with DELIBERATE parallel edges (SyntheticCity emits
+            // none, which would leave the CSR overflow path unexercised — the
+            // guard below enforces this).
+            var rng = new SplitMix64(seed);
+            int n = 1500, mEdges = 6000;
+            var edges = new List<(int, int, float, float, float, float)>(mEdges + 400);
+            for (int i = 0; i < mEdges; i++)
+            {
+                int u = rng.NextInt(n), v = rng.NextInt(n);
+                if (u == v) { i--; continue; }
+                edges.Add((u, v, 1f + 9f * rng.NextFloat(), rng.NextFloat(), rng.NextFloat(), 1f));
+            }
+            for (int i = 0; i < 400; i++) // duplicates of existing pairs = parallel edges
+            {
+                var (u, v, _, _, _, _) = edges[rng.NextInt(mEdges)];
+                edges.Add((u, v, 1f + 9f * rng.NextFloat(), rng.NextFloat(), rng.NextFloat(), 1f));
+            }
+            var g = Graph.Build(n, edges);
+            for (int i = 0; i < g.EdgeCount; i++)
+                g.TimeLive[i] = g.TimeFree[i] * (0.6f + 2.0f * rng.NextFloat());
+            for (int i = 0; i < 60; i++) g.ClosureMult[rng.NextInt(g.EdgeCount)] = 1.2f + rng.NextFloat();
+            for (int i = 0; i < 15; i++) g.ClosureMult[rng.NextInt(g.EdgeCount)] = float.PositiveInfinity;
+            g.TimeLive[rng.NextInt(g.EdgeCount)] = float.PositiveInfinity;
+            g.TimeLive[rng.NextInt(g.EdgeCount)] = float.NaN;
+
+            var anchors = AnchorGrid.Build(new List<Preference>(), null, 4,
+                new[] { Scenario.FreeFlow, Scenario.Typical, Scenario.Live }, seed);
+            var rank = NestedDissection.ComputeOrder(g, out _);
+            var c = CchSkeleton.Build(g, rank);
+            var m = CchMetrics.Create(c, anchors);
+            m.ResetAll(); // parallel kernel path
+
+            int bad = 0;
+            for (int a = 0; a < c.ArcCount; a++)
+                for (int k = 0; k < m.K; k++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m.WFwd[a * m.K + k]) !=
+                        BitConverter.SingleToInt32Bits(m.OriginalArcWeight(a, k, true))) bad++;
+                    if (BitConverter.SingleToInt32Bits(m.WBwd[a * m.K + k]) !=
+                        BitConverter.SingleToInt32Bits(m.OriginalArcWeight(a, k, false))) bad++;
+                }
+            Check(bad == 0, $"seeding kernel diverged from managed OriginalArcWeight on {bad} lanes");
+            Check(c.ExtraFwd.Count + c.ExtraBwd.Count > 0,
+                "no parallel edges present — the CSR overflow path went unexercised");
         }
 
         private static void VerifyBurstKernelPortability()

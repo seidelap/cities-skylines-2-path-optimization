@@ -53,6 +53,22 @@ namespace CS2Path.Core
         private LongHeap _heap;
         private float[] _scratchF = null!, _scratchB = null!;
 
+        // Parallel-edge overflow flattened to CSR for the seeding kernel (the
+        // skeleton's Dictionary form stays authoritative for managed callers).
+        private int[] _extraFwdStart = null!, _extraFwdEdge = null!;
+        private int[] _extraBwdStart = null!, _extraBwdEdge = null!;
+
+        private static (int[] start, int[] edges) FlattenExtras(Dictionary<int, int[]> map, int arcCount)
+        {
+            var start = new int[arcCount + 1];
+            foreach (var kv in map) start[kv.Key + 1] = kv.Value.Length;
+            for (int a = 0; a < arcCount; a++) start[a + 1] += start[a];
+            var edges = new int[start[arcCount]];
+            foreach (var kv in map)
+                Array.Copy(kv.Value, 0, edges, start[kv.Key], kv.Value.Length);
+            return (start, edges);
+        }
+
         public static CchMetrics Create(CchSkeleton c, AnchorGrid anchors)
         {
             var m = new CchMetrics
@@ -68,6 +84,8 @@ namespace CS2Path.Core
             m._scratchF = new float[m.K];
             m._scratchB = new float[m.K];
             m.NodeArcChangeEpoch = new int[c.NodeCount];
+            (m._extraFwdStart, m._extraFwdEdge) = FlattenExtras(c.ExtraFwd, c.ArcCount);
+            (m._extraBwdStart, m._extraBwdEdge) = FlattenExtras(c.ExtraBwd, c.ArcCount);
             return m;
         }
 
@@ -89,17 +107,49 @@ namespace CS2Path.Core
         }
 
         /// <summary>Load original-edge weights (or +inf for pure shortcuts) for
-        /// lanes [kFrom, kFrom+kCount).</summary>
+        /// lanes [kFrom, kFrom+kCount). Embarrassingly parallel — every arc's
+        /// lanes depend only on that arc's own edges — so the arc range is
+        /// split across threads with no synchronization. The kernel replicates
+        /// AnchorGrid.EdgeWeight expression-for-expression, and the verify
+        /// suite pins the two implementations bit-identical.</summary>
         public void Reset(int kFrom, int kCount)
         {
             var c = C;
-            for (int a = 0; a < c.ArcCount; a++)
+            var g = c.G;
+            var descs = Anchors.Descriptors;
+            fixed (float* wf = WFwd, wb = WBwd,
+                   tf = g.TimeFree, tt = g.TimeTypical, tl = g.TimeLive,
+                   mo = g.Money, co = g.Comfort, cm = g.ClosureMult)
+            fixed (AnchorGrid.MetricDesc* dp = descs)
+            fixed (int* of = c.OrigFwd, ob = c.OrigBwd,
+                   efs = _extraFwdStart, efe = _extraFwdEdge,
+                   ebs = _extraBwdStart, ebe = _extraBwdEdge)
             {
-                int baseA = a * K;
-                for (int k = kFrom; k < kFrom + kCount; k++)
+                var ctx = new BurstKernels.SeedContext
                 {
-                    WFwd[baseA + k] = OriginalArcWeight(a, k, true);
-                    WBwd[baseA + k] = OriginalArcWeight(a, k, false);
+                    WFwd = wf, WBwd = wb,
+                    TimeFree = tf, TimeTypical = tt, TimeLive = tl,
+                    Money = mo, Comfort = co, ClosureMult = cm,
+                    Desc = dp, OrigFwd = of, OrigBwd = ob,
+                    ExtraFwdStart = efs, ExtraFwdEdge = efe,
+                    ExtraBwdStart = ebs, ExtraBwdEdge = ebe,
+                    K = K,
+                };
+                int threads = Environment.ProcessorCount;
+                if (c.ArcCount < 32_768 || threads == 1)
+                {
+                    BurstKernels.SeedArcs(in ctx, 0, c.ArcCount, kFrom, kCount);
+                }
+                else
+                {
+                    int chunk = (c.ArcCount + threads - 1) / threads;
+                    var ctxLocal = ctx;
+                    Parallel.For(0, threads, ti =>
+                    {
+                        int lo = ti * chunk;
+                        int hiA = Math.Min(c.ArcCount, lo + chunk);
+                        if (lo < hiA) BurstKernels.SeedArcs(in ctxLocal, lo, hiA, kFrom, kCount);
+                    });
                 }
             }
         }

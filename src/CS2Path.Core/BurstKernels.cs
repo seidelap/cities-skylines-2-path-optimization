@@ -296,6 +296,82 @@ namespace CS2Path.Core
         }
 
         /// <summary>
+        /// Everything the seeding pass reads, as raw pointers. Grouped in a
+        /// struct so the call site stays legible; contains no arrays and no
+        /// managed types, so it passes the portability lint and can cross into
+        /// a Burst job by value.
+        /// </summary>
+        public struct SeedContext
+        {
+            public float* WFwd, WBwd;
+            public float* TimeFree, TimeTypical, TimeLive, Money, Comfort, ClosureMult;
+            public AnchorGrid.MetricDesc* Desc;
+            public int* OrigFwd, OrigBwd;
+            // Parallel-edge overflow, flattened to CSR (the managed original is
+            // a Dictionary, which no kernel may touch).
+            public int* ExtraFwdStart, ExtraFwdEdge, ExtraBwdStart, ExtraBwdEdge;
+            public int K;
+        }
+
+        /// <summary>
+        /// One original-edge weight under one lane — the kernel twin of
+        /// AnchorGrid.EdgeWeight, replicated EXPRESSION-FOR-EXPRESSION in the
+        /// same evaluation order so seeding stays bit-identical to the managed
+        /// path (which remains in use by partial customization's RecomputeArc).
+        /// Scenario codes: 0 = FreeFlow, 1 = Typical, else Live.
+        /// Finiteness is tested with pure comparisons (NaN fails both) because
+        /// kernels avoid library calls.
+        /// </summary>
+        public static float SeedEdgeWeight(in SeedContext c, int edge, int k)
+        {
+            float mult = c.ClosureMult[edge];
+            if (mult == float.PositiveInfinity) return float.PositiveInfinity;
+            AnchorGrid.MetricDesc d = c.Desc[k];
+            if (d.Scen == 0)
+                return d.PrefT * c.TimeFree[edge] + d.PrefM * c.Money[edge] + d.PrefC * c.Comfort[edge];
+            if (d.Scen == 1)
+                return d.PrefT * c.TimeTypical[edge] + d.PrefM * c.Money[edge] + d.PrefC * c.Comfort[edge];
+            float tl = c.TimeLive[edge];
+            if (!(tl < float.PositiveInfinity) || !(tl > float.NegativeInfinity))
+                return float.PositiveInfinity;
+            return (d.PrefT * tl + d.PrefM * c.Money[edge] + d.PrefC * c.Comfort[edge]) * mult;
+        }
+
+        /// <summary>
+        /// Seed arcs [arcFrom, arcTo) for lanes [kFrom, kFrom+kCount):
+        /// original-edge weight (+inf for pure shortcuts) min-ed over parallel
+        /// edges. Embarrassingly parallel — each arc's lanes depend only on
+        /// that arc's own original edges, so callers may split the arc range
+        /// across threads with no synchronization of any kind.
+        /// </summary>
+        public static void SeedArcs(in SeedContext c, int arcFrom, int arcTo, int kFrom, int kCount)
+        {
+            for (int a = arcFrom; a < arcTo; a++)
+            {
+                int baseA = a * c.K;
+                int ef = c.OrigFwd[a], eb = c.OrigBwd[a];
+                for (int k = kFrom; k < kFrom + kCount; k++)
+                {
+                    float wf = ef < 0 ? float.PositiveInfinity : SeedEdgeWeight(in c, ef, k);
+                    for (int x = c.ExtraFwdStart[a]; x < c.ExtraFwdStart[a + 1]; x++)
+                    {
+                        float w2 = SeedEdgeWeight(in c, c.ExtraFwdEdge[x], k);
+                        if (w2 < wf) wf = w2;
+                    }
+                    c.WFwd[baseA + k] = wf;
+
+                    float wb = eb < 0 ? float.PositiveInfinity : SeedEdgeWeight(in c, eb, k);
+                    for (int x = c.ExtraBwdStart[a]; x < c.ExtraBwdStart[a + 1]; x++)
+                    {
+                        float w2 = SeedEdgeWeight(in c, c.ExtraBwdEdge[x], k);
+                        if (w2 < wb) wb = w2;
+                    }
+                    c.WBwd[baseA + k] = wb;
+                }
+            }
+        }
+
+        /// <summary>
         /// Min-plus fold of one arc's lower triangles into scratch lanes — the
         /// inner loop of partial customization's RecomputeArc.
         /// </summary>
