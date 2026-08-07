@@ -36,6 +36,10 @@ namespace CS2Path.Core
         /// FullCustomizeParallel call. Zero means the run was serial throughout.</summary>
         public int LastParallelLevelsSplit;
 
+        /// <summary>Tasks executed by the last FullCustomizeParallelTasks call
+        /// (0 = fell back to sequential because no frontier was built).</summary>
+        public int LastTasksRun;
+
         /// <summary>Monotonic epoch, bumped per (partial) customization. Together
         /// with NodeArcChangeEpoch this is the "dirty flag" consumers use to
         /// event-drive their own refreshes (Layer 3 buckets): a backward search
@@ -181,6 +185,73 @@ namespace CS2Path.Core
                             BurstKernels.ContractLevelRange(wfp, wbp, usp, uhp, lnp, lo, hi, K, 1);
                     });
                 }
+            }
+        }
+
+        /// <summary>
+        /// Task-parallel full customization over dissection-cell subtrees — the
+        /// replacement for the level scheme after measurement showed the level
+        /// approach nets ~1.08× (a 38% level-order locality tax plus a ~2×
+        /// atomic kernel on ~95% of triangles).
+        ///
+        /// Each task is a contiguous, downward-closed rank range, contracted in
+        /// RANK ORDER with the plain vectorizable kernel; only writes into
+        /// enclosing separators (target tail outside the task) pay an atomic
+        /// min. Phase 2 contracts the remaining separator ranks sequentially,
+        /// ascending — by then every task input below them is final.
+        ///
+        /// Bit-identical to <see cref="FullCustomize"/>: the candidate multiset
+        /// per arc is unchanged, min is exact and order-independent, and the
+        /// verify suite asserts identity plus the structural invariants
+        /// (partition, downward closure, cross-task contention counted
+        /// deterministically).
+        /// </summary>
+        public void FullCustomizeParallelTasks(int threads = 0)
+        {
+            var c = C;
+            if (c.TaskLo == null || c.TaskHi == null || c.Phase2Ranks == null || c.TaskLo.Length < 2)
+            {
+                LastTasksRun = 0;
+                FullCustomize();
+                return;
+            }
+            ChangeEpoch++;
+            Array.Fill(NodeArcChangeEpoch, ChangeEpoch);
+            if (threads <= 0) threads = Environment.ProcessorCount;
+            int nTasks = c.TaskLo.Length;
+            LastTasksRun = nTasks;
+
+            // Largest tasks first: with ~4 tasks per core, finishing a monster
+            // last is the main load-imbalance risk.
+            var order = new int[nTasks];
+            for (int i = 0; i < nTasks; i++) order[i] = i;
+            var sizes = new int[nTasks];
+            for (int i = 0; i < nTasks; i++) sizes[i] = c.TaskHi[i] - c.TaskLo[i];
+            Array.Sort(sizes, order);
+            Array.Reverse(order);
+
+            fixed (float* wf = WFwd, wb = WBwd)
+            fixed (int* upStart = c.UpStart, upHead = c.UpHead, nodeAtRank = c.NodeAtRank, rank = c.Rank)
+            {
+                float* wfp = wf; float* wbp = wb;
+                int* usp = upStart; int* uhp = upHead; int* nrp = nodeAtRank; int* rkp = rank;
+                int next = -1;
+                var lo = c.TaskLo; var hi = c.TaskHi;
+                var ordLocal = order;
+                Parallel.For(0, Math.Min(threads, nTasks), _ =>
+                {
+                    while (true)
+                    {
+                        int slot = Interlocked.Increment(ref next);
+                        if (slot >= nTasks) return;
+                        int t = ordLocal[slot];
+                        BurstKernels.CustomizeTaskRange(wfp, wbp, usp, uhp, nrp, rkp, lo[t], hi[t], K);
+                    }
+                });
+                // Phase 2: enclosing separators, ascending rank, single thread.
+                var p2 = c.Phase2Ranks;
+                for (int i = 0; i < p2.Length; i++)
+                    BurstKernels.ContractNode(wfp, wbp, usp, uhp, nrp[p2[i]], K, 0);
             }
         }
 

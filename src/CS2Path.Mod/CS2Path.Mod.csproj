@@ -17,6 +17,11 @@
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <!-- The in-game Burst jobs (BurstCustomizationJobs) hold raw pointers into
+         pinned buffers. Without this, the OUT_OF_GAME build compiles (the unsafe
+         struct is #if'd away) but the FIRST in-game build fails — exactly the
+         wrong place to discover it. Found by adversarial review. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <InGame Condition="'$(InGame)' == ''">false</InGame>
   </PropertyGroup>
 

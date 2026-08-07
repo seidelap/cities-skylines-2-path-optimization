@@ -21,7 +21,7 @@ Where a target is missed even accounting for that, it is called out honestly.
 | §2(d) joint destination+route choice | bucket scans return (destination, route) menus in ~150 µs, verified exact vs brute force |
 | §2(e) closures graded and metered | hard closures exact in every scenario (verified round-trip); soft closures graded with hysteresis; event wakes metered upstream-first |
 
-## Correctness verification (72 checks, all passing)
+## Correctness verification (101 checks, all passing)
 
 CCH distances ≡ Dijkstra across every anchor metric (city + random graphs, BFS-fallback
 order); partial customization ≡ full recustomization; hard-closure + reopen round-trips
@@ -59,7 +59,8 @@ Graph: **131,039 nodes / 482,554 directed lane-edges** (three road tiers, holes)
 |---|---|---|
 | full customization, all 16 metrics | 531 ms | < 10 ms (Burst/SIMD budget) |
 | full customization split: seeding vs sweep | ResetAll 190 ms (21%) + triangle sweep 717 ms (79%), sweep stable to ±0.7% | the ported half is the dominant half |
-| full customization, level-parallel (331 levels, 4-core container) | vs the 722 ms rank-order sweep: 1t=998 ms (0.72×), 2t=950 ms (0.76×), **4t=667 ms (1.08×)** | **no speedup**; level ordering costs 38% before threads help — see "Burst port" |
+| full customization, level-parallel (331 levels; superseded) | vs the rank-order sweep: 4t best **1.22×** | kept for A/B — see "Burst port" |
+| full customization, **task-parallel over dissection-cell subtrees** (24 tasks + 372 phase-2 separator nodes) | vs the 761 ms rank-order sweep: 1t=763 ms (1.00×), 2t=395 ms (**1.93×**), **4t=217 ms (3.51×)** | **the production path** — wired into RoutingEngine.Build; bit-identical, invariant-checked on two graph shapes |
 | partial, 100 edges ±10% drift, scattered (live lanes) | median 92.38 ms, p99 218.56 ms (43,016 arcs) | < 1 ms |
 | partial, 150 edges ±10% drift, clustered (one congestion pocket) | median 6.92 ms, p99 15.24 ms (3,362 arcs) | < 1 ms |
 | partial, 1000 edges ±10% drift, scattered (live lanes) | median 500.60 ms, p99 533.74 ms (282,503 arcs) | — |
@@ -360,6 +361,41 @@ so a conflict-free partition looks reachable — and (b) removing the ordering
 tax by processing levels in rank order within each level. Neither is
 speculative now; both attack measured causes.
 
+### RESOLVED: the task decomposition delivers what levels could not
+
+Fresh-eyes observation after the corrections above: nested dissection already
+provides a better parallel decomposition than elimination-tree levels. Ranks
+are emitted recurse(A), recurse(B), separator — so **every dissection-cell
+subtree is a contiguous, downward-closed rank range**. Tasks run the plain
+sequential kernel in rank order over disjoint ranges (no ordering tax, no
+atomics), and only writes into enclosing separators — provably the only arcs
+two tasks can share — pay an atomic min. Remaining separators contract
+sequentially in a short phase 2 (372 nodes at 131k).
+
+| configuration | time | vs 761 ms rank-order sweep |
+|---|---|---|
+| task-parallel, 1 thread | 763 ms | 1.00× — ordering tax eliminated |
+| task-parallel, 2 threads | 395 ms | **1.93×** |
+| task-parallel, 4 threads | **217 ms** | **3.51× (88% efficiency)** |
+| level-parallel (superseded), 4 threads | 624 ms | 1.22× |
+
+Both measured causes of the level scheme's failure are addressed by
+construction: tasks traverse in rank order (the 38% tax measured above), and
+~all triangle work runs the non-atomic kernel (the ~2× tax). This is now the
+production path — `RoutingEngine.Build` uses it, the in-game Burst wrapper
+schedules one job per task with work-stealing, and it is proven bit-identical
+and invariant-checked (partition, full up-arc closure, single-plain-writer,
+kernel-predicate equivalence, cross-task contention non-zero) on both a
+geometric city and a BFS-fallback random graph.
+
+A second adversarial review round over this code raised 8 findings (0 of its
+refutations failed): the two majors — the path was wired into no production
+caller, and the test census re-derived the kernel's boundary predicate instead
+of calling it, making an off-by-one undetectable — are fixed, along with a
+mixed plain/atomic write-overlap blind spot demonstrated by a probe that
+grafted a phase-2 rank into a task and passed the old suite 400/400 despite a
+real race.
+
 ### A note on the tests
 
 The bit-identity check that gave me confidence in the parallel path was itself
@@ -449,7 +485,7 @@ game. `harness import` already reports it whenever a demand trace is present
 |---|---|---|
 | point-to-point query p99 < 20 µs at 10⁵ nodes, REAL topology | **169–360 µs p99, 112–203× vs Dijkstra** across the real-morphology sweep (Ruhr 134k: 87 µs median / 169 µs p99; greater Paris 202k: 216/360 µs; NY 264k: 132/273 µs) with Inertial Flow separators | architectural claim now holds on real maps at synthetic-benchmark levels; the absolute 20 µs still needs Burst-class constant factors |
 | point-to-point query p99 < 20 µs at 10⁵ nodes, synthetic | 174 µs p99 (94.5 µs median), 122× faster than per-trip Dijkstra, 300/300 exact | architectural win proven; remaining gap to the absolute target is Burst-class constant factors |
-| full customization < 10 ms | 531 ms (16 metrics, single-thread C#). Split: seeding 190 ms (21%) + sweep 722 ms (79%). Level-parallel nets **1.08× at 4 cores** — no real gain | **miss.** The sweep is Burst-legal and bit-identical under parallelism, but thread-parallelism does not pay here: level ordering costs 38% up front and the atomic kernel is ~2× the non-atomic one. An earlier false-sharing diagnosis was disproved by direct measurement (64-byte alignment moves ~0%). Next levers, both measured rather than guessed: a conflict-free partition that removes the atomic, and rank-ordered traversal within levels |
+| full customization < 10 ms | seeding 190 ms + sweep 761 ms sequential → **task-parallel sweep 217 ms at 4 cores (3.51×, 88% efficiency)**, wired as the production path and bit-identical | still a miss on absolute (~400 ms end-to-end this container), but the parallel story is now real: the dissection-cell task decomposition scales near-linearly where the level scheme managed 1.2×. Burst codegen and 8–16 game cores stack on top; seeding parallelization (embarrassingly parallel) is the remaining sequential piece |
 | typical partial customization < 1 ms | 6.9 ms median for a clustered congestion pocket (3,362 of 1.7M arcs — 0.2%); scattered random edges 92 ms | scaling property (cost ∝ change, not graph) demonstrated; absolute target plausible only under Burst with real change locality |
 | sim speed ≥ 95% at 400k population | proxy only: 100k trips at 6.5× realtime, single-threaded C#, all subsystems itemized | not directly measurable outside the game |
 | oscillation amplitude reduced ≥ 5× | **5.9×** vs the oscillating vanilla regime (fast signal, re-measured under the flow partitioner); vanilla's gridlock regime avoided entirely (2.6× travel-time win) | **met** |

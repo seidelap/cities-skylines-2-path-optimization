@@ -96,14 +96,91 @@ namespace CS2Path.Mod
         }
 
         /// <summary>
+        /// One dissection-cell task: the sequential rank-order sweep over the
+        /// task's contiguous range, atomics only for enclosing-separator
+        /// writes. This is the production decomposition — measured 3.5x on 4
+        /// cores in the harness, versus 1.2x for the level scheme above (kept
+        /// for A/B). innerloopBatchCount = 1 gives Unity's scheduler work-
+        /// stealing over whole tasks, replacing the harness's Interlocked
+        /// largest-first queue.
+        /// </summary>
+        [BurstCompile(FloatMode = FloatMode.Strict, FloatPrecision = FloatPrecision.High,
+                      CompileSynchronously = true)]
+        public unsafe struct CustomizeTaskJob : IJobParallelFor
+        {
+            [NativeDisableUnsafePtrRestriction] public float* WFwd;
+            [NativeDisableUnsafePtrRestriction] public float* WBwd;
+            [NativeDisableUnsafePtrRestriction] public int* UpStart;
+            [NativeDisableUnsafePtrRestriction] public int* UpHead;
+            [NativeDisableUnsafePtrRestriction] public int* NodeAtRank;
+            [NativeDisableUnsafePtrRestriction] public int* Rank;
+            [NativeDisableUnsafePtrRestriction] public int* TaskLo;   // sorted largest-first by the scheduler
+            [NativeDisableUnsafePtrRestriction] public int* TaskHi;
+            public int K;
+
+            public void Execute(int i)
+            {
+                BurstKernels.CustomizeTaskRange(WFwd, WBwd, UpStart, UpHead, NodeAtRank, Rank,
+                                               TaskLo[i], TaskHi[i], K);
+            }
+        }
+
+        /// <summary>Phase 2: contract the enclosing separators sequentially in
+        /// ascending rank, after every task has completed.</summary>
+        [BurstCompile(FloatMode = FloatMode.Strict, FloatPrecision = FloatPrecision.High,
+                      CompileSynchronously = true)]
+        public unsafe struct Phase2Job : IJob
+        {
+            [NativeDisableUnsafePtrRestriction] public float* WFwd;
+            [NativeDisableUnsafePtrRestriction] public float* WBwd;
+            [NativeDisableUnsafePtrRestriction] public int* UpStart;
+            [NativeDisableUnsafePtrRestriction] public int* UpHead;
+            [NativeDisableUnsafePtrRestriction] public int* NodeAtRank;
+            [NativeDisableUnsafePtrRestriction] public int* Phase2Ranks;
+            public int Phase2Count;
+            public int K;
+
+            public void Execute()
+            {
+                for (int i = 0; i < Phase2Count; i++)
+                    BurstKernels.ContractNode(WFwd, WBwd, UpStart, UpHead,
+                                              NodeAtRank[Phase2Ranks[i]], K, 0);
+            }
+        }
+
+        /// <summary>
         /// Pin managed weight arrays and run the sweep. Convenience for the
         /// adapter, which holds the Core engine's arrays rather than
         /// NativeArrays. GCHandle pinning is fine here because the sweep is a
-        /// bounded, synchronous unit of work.
+        /// bounded, synchronous unit of work. Uses the task decomposition when
+        /// the skeleton carries a frontier; falls back to the level jobs.
         /// </summary>
         public static unsafe void RunFullCustomize(CchMetrics metrics)
         {
             var c = metrics.C;
+            if (c.TaskLo != null && c.TaskHi != null && c.Phase2Ranks != null && c.TaskLo.Length >= 2)
+            {
+                fixed (float* wf = metrics.WFwd, wb = metrics.WBwd)
+                fixed (int* us = c.UpStart, uh = c.UpHead, nr = c.NodeAtRank, rk = c.Rank,
+                       tl = c.TaskLo, th = c.TaskHi, p2 = c.Phase2Ranks)
+                {
+                    var tasks = new CustomizeTaskJob
+                    {
+                        WFwd = wf, WBwd = wb, UpStart = us, UpHead = uh,
+                        NodeAtRank = nr, Rank = rk, TaskLo = tl, TaskHi = th,
+                        K = metrics.K,
+                    };
+                    var h = tasks.Schedule(c.TaskLo.Length, 1);
+                    var phase2 = new Phase2Job
+                    {
+                        WFwd = wf, WBwd = wb, UpStart = us, UpHead = uh,
+                        NodeAtRank = nr, Phase2Ranks = p2,
+                        Phase2Count = c.Phase2Ranks.Length, K = metrics.K,
+                    };
+                    phase2.Schedule(h).Complete();
+                }
+                return;
+            }
             fixed (float* wf = metrics.WFwd, wb = metrics.WBwd)
             fixed (int* us = c.UpStart, uh = c.UpHead, ln = c.LevelNodes, ls = c.LevelStart)
             {
@@ -113,11 +190,11 @@ namespace CS2Path.Mod
 #else
         /// <summary>
         /// Out-of-game build: the harness drives
-        /// <see cref="CchMetrics.FullCustomizeParallel"/> directly, which runs the
-        /// identical kernels over the identical level decomposition on plain
-        /// threads. Only the scheduler differs.
+        /// <see cref="CchMetrics.FullCustomizeParallelTasks"/> directly, which
+        /// runs the identical kernels over the identical task decomposition on
+        /// plain threads. Only the scheduler differs.
         /// </summary>
-        public static void RunFullCustomize(CchMetrics metrics) => metrics.FullCustomizeParallel();
+        public static void RunFullCustomize(CchMetrics metrics) => metrics.FullCustomizeParallelTasks();
 #endif
     }
 }

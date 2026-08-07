@@ -46,34 +46,42 @@ namespace CS2Path.Core
         public static void RelaxTriangle(float* wFwd, float* wBwd, int b1, int b2, int bt, int K)
         {
             int k = 0;
-            // 4-wide body: independent lanes, no cross-lane carries, so both
-            // compilers turn this into packed min/add.
+            // Select + UNCONDITIONAL store, not a predicated store: adversarial
+            // review pointed out that `if (f < t) t = f` is a shape neither
+            // LLVM (Burst) nor RyuJIT will vectorize — a store under a branch
+            // cannot become a packed min. `t = f < t ? f : t` is a select and
+            // maps directly onto vminps. Result bits are identical: when the
+            // candidate does not improve, the same value is stored back.
             for (; k <= K - 4; k += 4)
             {
+                float t0 = wFwd[bt + k + 0], t1 = wFwd[bt + k + 1], t2 = wFwd[bt + k + 2], t3 = wFwd[bt + k + 3];
                 float f0 = wBwd[b1 + k + 0] + wFwd[b2 + k + 0];
                 float f1 = wBwd[b1 + k + 1] + wFwd[b2 + k + 1];
                 float f2 = wBwd[b1 + k + 2] + wFwd[b2 + k + 2];
                 float f3 = wBwd[b1 + k + 3] + wFwd[b2 + k + 3];
-                if (f0 < wFwd[bt + k + 0]) wFwd[bt + k + 0] = f0;
-                if (f1 < wFwd[bt + k + 1]) wFwd[bt + k + 1] = f1;
-                if (f2 < wFwd[bt + k + 2]) wFwd[bt + k + 2] = f2;
-                if (f3 < wFwd[bt + k + 3]) wFwd[bt + k + 3] = f3;
+                wFwd[bt + k + 0] = f0 < t0 ? f0 : t0;
+                wFwd[bt + k + 1] = f1 < t1 ? f1 : t1;
+                wFwd[bt + k + 2] = f2 < t2 ? f2 : t2;
+                wFwd[bt + k + 3] = f3 < t3 ? f3 : t3;
 
+                float u0 = wBwd[bt + k + 0], u1 = wBwd[bt + k + 1], u2 = wBwd[bt + k + 2], u3 = wBwd[bt + k + 3];
                 float g0 = wBwd[b2 + k + 0] + wFwd[b1 + k + 0];
                 float g1 = wBwd[b2 + k + 1] + wFwd[b1 + k + 1];
                 float g2 = wBwd[b2 + k + 2] + wFwd[b1 + k + 2];
                 float g3 = wBwd[b2 + k + 3] + wFwd[b1 + k + 3];
-                if (g0 < wBwd[bt + k + 0]) wBwd[bt + k + 0] = g0;
-                if (g1 < wBwd[bt + k + 1]) wBwd[bt + k + 1] = g1;
-                if (g2 < wBwd[bt + k + 2]) wBwd[bt + k + 2] = g2;
-                if (g3 < wBwd[bt + k + 3]) wBwd[bt + k + 3] = g3;
+                wBwd[bt + k + 0] = g0 < u0 ? g0 : u0;
+                wBwd[bt + k + 1] = g1 < u1 ? g1 : u1;
+                wBwd[bt + k + 2] = g2 < u2 ? g2 : u2;
+                wBwd[bt + k + 3] = g3 < u3 ? g3 : u3;
             }
             for (; k < K; k++)
             {
+                float t = wFwd[bt + k];
                 float f = wBwd[b1 + k] + wFwd[b2 + k];
-                if (f < wFwd[bt + k]) wFwd[bt + k] = f;
+                wFwd[bt + k] = f < t ? f : t;
+                float u = wBwd[bt + k];
                 float b = wBwd[b2 + k] + wFwd[b1 + k];
-                if (b < wBwd[bt + k]) wBwd[bt + k] = b;
+                wBwd[bt + k] = b < u ? b : u;
             }
         }
 
@@ -195,6 +203,74 @@ namespace CS2Path.Core
         {
             for (int r = rankFrom; r < rankTo; r++)
                 ContractNode(wFwd, wBwd, upStart, upHead, nodeAtRank[r], K, 0);
+        }
+
+        /// <summary>
+        /// Contract one node under the TASK decomposition: writes are atomic
+        /// only when the target arc's tail lies OUTSIDE the running task's rank
+        /// range (rank[A] &gt;= boundaryRank).
+        ///
+        /// Why this is sufficient: a task is a dissection-cell subtree = a
+        /// contiguous, downward-closed rank range [lo, hi). For x in the task,
+        /// every up-neighbour A of x is an elimination-tree ancestor of x, so A
+        /// is either inside the same task (rank &lt; hi) or a separator of an
+        /// ENCLOSING cell (rank &gt;= hi) — never inside a sibling task. If A is
+        /// in-task, no other task can target arc (A, B) at all (A is not an
+        /// ancestor of any other task's node), so the plain vectorizable write
+        /// is safe. If A is outside, sibling tasks under the same separators may
+        /// target (A, B) concurrently, so the write must be an atomic min.
+        /// Reads are always safe: a contraction reads only arcs with tail x,
+        /// which are written exclusively by x's own descendants — all inside
+        /// this task by downward closure.
+        ///
+        /// The decision is per up-neighbour, not per triangle: one rank load
+        /// and compare per arc of Up[x].
+        /// </summary>
+        /// <summary>The task scheme's write-classification predicate: shared
+        /// (atomic) iff the target arc's tail lies at or above the task's end
+        /// rank. A single definition on purpose — the verify suite's
+        /// deterministic census calls THIS method rather than re-deriving the
+        /// rule, so an off-by-one here fails the suite instead of silently
+        /// weakening the atomic coverage (adversarial review showed a re-derived
+        /// predicate made a &gt;=/&gt; bug undetectable).</summary>
+        public static byte SharedWrite(int rankA, int boundaryRank)
+            => rankA >= boundaryRank ? (byte)1 : (byte)0;
+
+        public static void ContractNodeBoundary(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int* rank,
+            int x, int K, int boundaryRank)
+        {
+            int s = upStart[x], e = upStart[x + 1];
+            for (int i = s; i < e; i++)
+            {
+                int a = upHead[i];
+                byte shared = SharedWrite(rank[a], boundaryRank);
+                int p = s, q = upStart[a], qe = upStart[a + 1];
+                while (p < e && q < qe)
+                {
+                    int hb = upHead[p], hb2 = upHead[q];
+                    if (hb < hb2) { p++; }
+                    else if (hb > hb2) { q++; }
+                    else
+                    {
+                        if (shared != 0) RelaxTriangleAtomic(wFwd, wBwd, i * K, p * K, q * K, K);
+                        else RelaxTriangle(wFwd, wBwd, i * K, p * K, q * K, K);
+                        p++; q++;
+                    }
+                }
+            }
+        }
+
+        /// <summary>One whole task: the sequential rank-order sweep over the
+        /// task's contiguous range, boundary-aware. This preserves the
+        /// sequential kernel's traversal order INSIDE the task, which is where
+        /// the level decomposition was paying its 38% locality tax.</summary>
+        public static void CustomizeTaskRange(
+            float* wFwd, float* wBwd, int* upStart, int* upHead, int* nodeAtRank, int* rank,
+            int rankFrom, int rankTo, int K)
+        {
+            for (int r = rankFrom; r < rankTo; r++)
+                ContractNodeBoundary(wFwd, wBwd, upStart, upHead, rank, nodeAtRank[r], K, rankTo);
         }
 
         /// <summary>

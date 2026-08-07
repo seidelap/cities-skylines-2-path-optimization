@@ -340,6 +340,30 @@ namespace CS2Path.Harness
                               $"| {eng.Skeleton.LevelCount} levels, {Environment.ProcessorCount} cores");
             Console.WriteLine($"  NOTE: 1t uses the non-atomic kernel; 2t+ uses the atomic kernel for " +
                               $"~95% of triangles, so 1t is NOT the same computation as 2t+.");
+
+            // Task decomposition (dissection-cell subtrees): rank-order inside
+            // each task, atomics only on enclosing-separator writes.
+            var taskScaling = new List<(int t, double ms)>();
+            foreach (int t in new[] { 1, 2, 4, Environment.ProcessorCount })
+            {
+                if (taskScaling.Exists(s => s.t == t)) continue;
+                var reps = new List<double>();
+                for (int rep = 0; rep < 3; rep++)
+                {
+                    eng.Metrics.ResetAll();
+                    sw.Restart();
+                    eng.Metrics.FullCustomizeParallelTasks(t);
+                    reps.Add(sw.Elapsed.TotalMilliseconds);
+                }
+                reps.Sort();
+                taskScaling.Add((t, reps[reps.Count / 2]));
+            }
+            double fullTaskMs = taskScaling[taskScaling.Count - 1].ms;
+            string taskStr = string.Join(", ", taskScaling.ConvertAll(s =>
+                $"{s.t}t={s.ms:N0}ms({sweepMed / Math.Max(0.001, s.ms):0.00}x)"));
+            int nT = eng.Skeleton.TaskLo?.Length ?? 0;
+            int p2 = eng.Skeleton.Phase2Ranks?.Length ?? 0;
+            Console.WriteLine($"  task-parallel {taskStr} | {nT} tasks + {p2} phase-2 separator nodes");
             // Leave the engine in the canonical sequential state for everything
             // that follows, so no later measurement inherits the parallel run.
             eng.Metrics.ResetAll();

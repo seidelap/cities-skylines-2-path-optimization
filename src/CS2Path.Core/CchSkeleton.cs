@@ -53,6 +53,79 @@ namespace CS2Path.Core
         public int[] LevelStart = null!;
         public int[] LevelNodes = null!;
 
+        // Task decomposition for parallel customization (the level scheme's
+        // replacement — see FullCustomizeParallelTasks). Each task is a
+        // dissection-cell subtree, i.e. a CONTIGUOUS, downward-closed rank
+        // range [TaskLo[i], TaskHi[i]); Phase2Ranks are the ranks of enclosing
+        // separators above the task frontier, sorted ascending, contracted
+        // sequentially after all tasks complete. Null until BuildTaskFrontier
+        // is called (needs the dissection cell paths, which the skeleton alone
+        // does not have).
+        public int[]? TaskLo, TaskHi;
+        public int[]? Phase2Ranks;
+
+        /// <summary>
+        /// Carve the elimination order into parallel tasks using the nested
+        /// dissection structure itself. Nested dissection emits ranks as
+        /// recurse(A), recurse(B), separator — so every cell subtree occupies a
+        /// contiguous rank range with its separator at the top. Recursively
+        /// split ranges at cell boundaries until tasks are small enough,
+        /// diverting each split cell's separator nodes to the sequential
+        /// phase-2 list. Cells that cannot be split (degenerate/BFS-ordered
+        /// chunks, or below minTaskSize) become tasks whole.
+        /// </summary>
+        public void BuildTaskFrontier(NestedDissection.CellPath[] cellPaths, int minTaskSize)
+        {
+            var los = new List<int>();
+            var his = new List<int>();
+            var phase2 = new List<int>();
+
+            void Split(int lo, int hi, ulong path, byte depth)
+            {
+                if (hi - lo <= 0) return;
+                // Separator nodes of THIS cell sit at the top of the range and
+                // carry exactly (path, depth).
+                int sepStart = hi;
+                while (sepStart > lo)
+                {
+                    var cp = cellPaths[NodeAtRank[sepStart - 1]];
+                    if (cp.Depth == depth && cp.PathBits == path) sepStart--;
+                    else break;
+                }
+
+                bool tooSmall = (long)(hi - lo) < Math.Max(2L, (long)minTaskSize) * 2;
+                if (tooSmall || sepStart == lo || depth >= 62)
+                {
+                    los.Add(lo); his.Add(hi);
+                    return;
+                }
+                // Children: bit `depth` of the path distinguishes side A (0)
+                // from side B (1); all child-subtree nodes have Depth > depth.
+                int mid = lo;
+                while (mid < sepStart)
+                {
+                    var cp = cellPaths[NodeAtRank[mid]];
+                    if (cp.Depth > depth && ((cp.PathBits >> depth) & 1UL) == 1UL) break;
+                    mid++;
+                }
+                if (mid == lo || mid == sepStart)
+                {
+                    // No usable A/B split below (degenerate chunk): keep whole.
+                    los.Add(lo); his.Add(hi);
+                    return;
+                }
+                for (int r = sepStart; r < hi; r++) phase2.Add(r);
+                Split(lo, mid, path, (byte)(depth + 1));
+                Split(mid, sepStart, path | (1UL << depth), (byte)(depth + 1));
+            }
+
+            Split(0, NodeCount, 0UL, 0);
+            phase2.Sort(); // ascending rank = valid sequential contraction order
+            TaskLo = los.ToArray();
+            TaskHi = his.ToArray();
+            Phase2Ranks = phase2.ToArray();
+        }
+
         public static CchSkeleton Build(Graph g, int[] rank)
         {
             var c = new CchSkeleton { G = g, NodeCount = g.NodeCount, Rank = rank };

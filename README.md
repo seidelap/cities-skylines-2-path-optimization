@@ -160,19 +160,17 @@ an assertion that the concurrent path actually engaged, so the test cannot pass
 vacuously), and a linter in the verify suite rejects managed constructs in the
 kernel file and confirms `CchMetrics` really routes through it.
 
-**Not done.** Level-parallel customization nets **1.08× on 4 cores** — no real
-gain. Measured against the 722 ms rank-order sweep: 1t=998 ms, 2t=950 ms,
-4t=667 ms. The parallelism itself works (1.50× against its own 1-thread
-baseline) but starts from a 38% hole, because level-order traversal costs that
-much in locality. Sequential remains the default.
-
-An adversarial review corrected three wrong explanations I had published here:
-the speedup ratios divided a numerator containing `ResetAll` by timings that
-excluded it; 1-thread and 2-thread runs were not the same computation (100%
-non-atomic vs ~95% atomic kernel); and false sharing was disproved outright —
-re-running the identical schedule on 64-byte-aligned buffers moved it ~0%. The
-real constraint is the atomic kernel (~2× the non-atomic one) plus the ordering
-tax. Details and the corrected table are in [`RESULTS.md`](RESULTS.md).
+**The parallel result, after two adversarial review rounds.** Level-based
+parallelism failed honestly (1.08–1.22× at 4 cores: a 38% level-order locality
+tax plus a ~2× atomic kernel on ~95% of triangles). Its replacement exploits
+the dissection structure itself: every cell subtree is a contiguous,
+downward-closed rank range, so tasks run the sequential rank-order kernel on
+disjoint ranges and only enclosing-separator writes are atomic. Measured
+against the 761 ms sequential sweep: **2t = 1.93×, 4t = 3.51× (217 ms, 88%
+efficiency)** — bit-identical, invariant-checked on two graph shapes, and
+wired as the production path in `RoutingEngine.Build` and the in-game job
+wrapper. Details, including the three wrong explanations that preceded the
+right one, are in [`RESULTS.md`](RESULTS.md).
 
 **One in-game detail that must not be "optimized" later:** the job wrappers pin
 `FloatMode.Strict`. Burst's default fast-math permits reassociation and FMA

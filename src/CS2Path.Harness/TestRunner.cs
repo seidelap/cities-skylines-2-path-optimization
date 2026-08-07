@@ -681,6 +681,20 @@ namespace CS2Path.Harness
                 Check(m.LastParallelLevelsSplit > 0,
                     $"parallel path never engaged at {threads} threads — test graph has no level " +
                     $"≥ {CchMetrics.MinLevelNodesToSplit} nodes, so bit-identity is vacuous");
+                // Task-parallel path: same bit-identity bar, same thread sweep.
+                m.ResetAll();
+                m.FullCustomizeParallelTasks(threads);
+                int taskMismatches = 0;
+                for (int i = 0; i < seqF.Length; i++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m.WFwd[i]) != BitConverter.SingleToInt32Bits(seqF[i])) taskMismatches++;
+                    if (BitConverter.SingleToInt32Bits(m.WBwd[i]) != BitConverter.SingleToInt32Bits(seqB[i])) taskMismatches++;
+                }
+                Check(taskMismatches == 0,
+                    $"TASK-parallel customization diverged from sequential on {taskMismatches} lanes at {threads} threads");
+                Check(m.LastTasksRun >= 2,
+                    $"task-parallel path fell back to sequential at {threads} threads — no frontier");
+
                 // HONESTY LIMIT, measured by adversarial review: this guard shows
                 // the concurrent path RAN, not that any arc was CONTENDED. On
                 // this graph only ~6% of triangles land in splittable levels and
@@ -764,6 +778,140 @@ namespace CS2Path.Harness
             Check(contendedArcs > 0,
                 "no arc is written by two nodes of the same level on this graph — the atomic min is " +
                 "untested here, so bit-identity cannot be read as evidence for it");
+
+            // ---- Task decomposition (dissection-cell subtrees) ----
+            // Run the full invariant census on TWO graph shapes: the city grid
+            // (geometric partitioner) and a coordinate-less random graph (BFS
+            // embedding + degenerate-guard paths) — adversarial review showed
+            // single-shape coverage leaves whole emission paths untested.
+            CheckTaskInvariants(c, "city-grid");
+            {
+                var rng2 = new SplitMix64(seed + 99);
+                int n2 = 3000, m2 = 12000;
+                var edges2 = new List<(int, int, float, float, float, float)>(m2);
+                for (int i = 0; i < m2; i++)
+                {
+                    int u = rng2.NextInt(n2), v = rng2.NextInt(n2);
+                    if (u == v) { i--; continue; }
+                    edges2.Add((u, v, 1f + 8f * rng2.NextFloat(), rng2.NextFloat(), rng2.NextFloat(), 1f));
+                }
+                var g2 = Graph.Build(n2, edges2); // no coordinates
+                var anchors2 = AnchorGrid.Build(new List<Preference>(), null, 3,
+                    new[] { Scenario.FreeFlow, Scenario.Live });
+                var eng2 = RoutingEngine.Build(g2, anchors2);
+                CheckTaskInvariants(eng2.Skeleton, "bfs-fallback");
+                // one bit-identity run on the second shape too
+                var m2m = eng2.Metrics;
+                m2m.ResetAll(); m2m.FullCustomize();
+                var f2 = (float[])m2m.WFwd.Clone(); var b2 = (float[])m2m.WBwd.Clone();
+                m2m.ResetAll(); m2m.FullCustomizeParallelTasks(4);
+                int mm = 0;
+                for (int i = 0; i < f2.Length; i++)
+                {
+                    if (BitConverter.SingleToInt32Bits(m2m.WFwd[i]) != BitConverter.SingleToInt32Bits(f2[i])) mm++;
+                    if (BitConverter.SingleToInt32Bits(m2m.WBwd[i]) != BitConverter.SingleToInt32Bits(b2[i])) mm++;
+                }
+                Check(mm == 0, $"task-parallel diverged on the BFS-fallback graph ({mm} lanes)");
+            }
+        }
+
+        /// <summary>Deterministic structural invariants of the task frontier.
+        /// Hardened per adversarial review: (a) the write census classifies
+        /// writes with BurstKernels.SharedWrite — the KERNEL's own predicate —
+        /// so an off-by-one there fails here instead of being re-derived away;
+        /// (b) closure is checked over EVERY up-arc, not just EtParent (the
+        /// first ancestor), which also catches cross-task READ races; (c) plain
+        /// and shared writer sets are cross-compared, closing the
+        /// mixed plain/atomic overlap class a graft corruption could hide in.</summary>
+        private static void CheckTaskInvariants(CchSkeleton c, string tag)
+        {
+            var lo = c.TaskLo; var hi = c.TaskHi; var p2r = c.Phase2Ranks;
+            Check(lo != null && hi != null && p2r != null && lo!.Length >= 2,
+                $"[{tag}] task frontier missing or trivial");
+            if (lo == null || hi == null || p2r == null || lo.Length < 2) return;
+
+            // (1) exact partition of rank space
+            var owner = new int[c.NodeCount];
+            for (int r = 0; r < c.NodeCount; r++) owner[r] = -2;
+            int doubleCovered = 0, p2Overlap = 0;
+            for (int t = 0; t < lo.Length; t++)
+                for (int r = lo[t]; r < hi[t]; r++)
+                {
+                    if (owner[r] != -2) doubleCovered++;
+                    owner[r] = t;
+                }
+            foreach (var r in p2r)
+            {
+                if (owner[r] != -2) p2Overlap++;
+                owner[r] = -1;
+            }
+            int uncovered = 0;
+            for (int r = 0; r < c.NodeCount; r++) if (owner[r] == -2) uncovered++;
+            Check(doubleCovered == 0, $"[{tag}] {doubleCovered} ranks covered by two tasks");
+            Check(p2Overlap == 0, $"[{tag}] {p2Overlap} phase-2 ranks overlap a task");
+            Check(uncovered == 0, $"[{tag}] {uncovered} ranks unassigned");
+
+            // (2) FULL up-arc closure: for every in-task node, every up-neighbour
+            // is same-task or phase-2 — the exact premise of ContractNodeBoundary.
+            // Also assert the kernel predicate agrees with task membership in
+            // both directions (catches >= vs > in either place).
+            int closureViolations = 0, predicateDisagreements = 0;
+            int plainRaces = 0, crossTaskContended = 0, mixedRaces = 0;
+            var plainWriter = new int[c.ArcCount];
+            for (int i = 0; i < c.ArcCount; i++) plainWriter[i] = -2;
+            var sharedTasks = new Dictionary<int, int>();
+            for (int t = 0; t < lo.Length; t++)
+            {
+                for (int r = lo[t]; r < hi[t]; r++)
+                {
+                    int x = c.NodeAtRank[r];
+                    int s = c.UpStart[x], e = c.UpStart[x + 1];
+                    for (int ii = s; ii < e; ii++)
+                    {
+                        int A = c.UpHead[ii];
+                        int ra = c.Rank[A];
+                        bool inTask = ra < hi[t] && owner[ra] == t;
+                        bool isP2 = owner[ra] == -1;
+                        if (!inTask && !isP2) closureViolations++;
+                        bool kernelShared = BurstKernels.SharedWrite(ra, hi[t]) != 0;
+                        if (kernelShared == inTask) predicateDisagreements++; // must be opposites
+                        int p3 = s, q = c.UpStart[A], qe = c.UpStart[A + 1];
+                        while (p3 < e && q < qe)
+                        {
+                            int hb = c.UpHead[p3], hb2 = c.UpHead[q];
+                            if (hb < hb2) p3++;
+                            else if (hb > hb2) q++;
+                            else
+                            {
+                                if (!kernelShared)
+                                {
+                                    if (plainWriter[q] == -2) plainWriter[q] = t;
+                                    else if (plainWriter[q] != t) plainRaces++;
+                                }
+                                else
+                                {
+                                    if (sharedTasks.TryGetValue(q, out int t0))
+                                    { if (t0 != t) crossTaskContended++; }
+                                    else sharedTasks[q] = t;
+                                }
+                                p3++; q++;
+                            }
+                        }
+                    }
+                }
+            }
+            foreach (var kv in sharedTasks)
+                if (plainWriter[kv.Key] != -2) mixedRaces++;
+            Check(closureViolations == 0,
+                $"[{tag}] UNSOUND: {closureViolations} up-arcs escape their task without being phase-2");
+            Check(predicateDisagreements == 0,
+                $"[{tag}] kernel SharedWrite predicate disagrees with task membership on {predicateDisagreements} arcs");
+            Check(plainRaces == 0,
+                $"[{tag}] UNSOUND: {plainRaces} arcs plain-written by two tasks");
+            Check(mixedRaces == 0,
+                $"[{tag}] UNSOUND: {mixedRaces} arcs both plain-written and atomically written by different tasks");
+            Check(crossTaskContended > 0,
+                $"[{tag}] no cross-task boundary contention — atomic path untested on this graph");
         }
 
         private static void VerifyBurstKernelPortability()
